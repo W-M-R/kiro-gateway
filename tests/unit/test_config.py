@@ -969,3 +969,232 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+
+class TestSslVerifyConfig:
+    """Tests for SSL_VERIFY and CA_BUNDLE_PATH configuration."""
+
+    def test_default_ssl_verify_is_true(self):
+        """
+        What it does: Verifies that SSL_VERIFY defaults to True.
+        Purpose: Ensure SSL verification is enabled by default for security.
+        """
+        print("Setup: Mocking os.getenv for SSL_VERIFY...")
+
+        original_getenv = os.getenv
+
+        def mock_getenv(key, default=None):
+            if key in ("SSL_VERIFY", "CA_BUNDLE_PATH"):
+                return default
+            return original_getenv(key, default)
+
+        with patch.object(os, 'getenv', side_effect=mock_getenv):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            print(f"SSL_VERIFY: {config_module.SSL_VERIFY}")
+            assert config_module.SSL_VERIFY is True
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ssl_verify_disabled(self):
+        """
+        What it does: Verifies that SSL_VERIFY=false disables verification.
+        Purpose: Ensure users can disable SSL for MITM proxy environments.
+        """
+        print("Setup: Setting SSL_VERIFY=false...")
+
+        with patch.dict(os.environ, {"SSL_VERIFY": "false", "CA_BUNDLE_PATH": ""}):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            print(f"SSL_VERIFY: {config_module.SSL_VERIFY}")
+            assert config_module.SSL_VERIFY is False
+
+            result = config_module.get_httpx_verify_config()
+            print(f"get_httpx_verify_config(): {result}")
+            assert result is False
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ssl_verify_truthy_values(self):
+        """
+        What it does: Verifies various truthy values enable SSL verification.
+        Purpose: Ensure 1/yes/on all enable verification.
+        """
+        for truthy in ("true", "1", "yes", "on", "TRUE", "Yes"):
+            print(f"Setup: Setting SSL_VERIFY={truthy}...")
+
+            with patch.dict(os.environ, {"SSL_VERIFY": truthy, "CA_BUNDLE_PATH": ""}):
+                import importlib
+                import kiro.config as config_module
+                importlib.reload(config_module)
+
+                print(f"  SSL_VERIFY: {config_module.SSL_VERIFY}")
+                assert config_module.SSL_VERIFY is True
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ssl_verify_falsy_values(self):
+        """
+        What it does: Verifies various falsy values disable SSL verification.
+        Purpose: Ensure 0/no/off all disable verification.
+        """
+        for falsy in ("false", "0", "no", "off", "FALSE", "No"):
+            print(f"Setup: Setting SSL_VERIFY={falsy}...")
+
+            with patch.dict(os.environ, {"SSL_VERIFY": falsy, "CA_BUNDLE_PATH": ""}):
+                import importlib
+                import kiro.config as config_module
+                importlib.reload(config_module)
+
+                print(f"  SSL_VERIFY: {config_module.SSL_VERIFY}")
+                assert config_module.SSL_VERIFY is False
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ca_bundle_path_takes_precedence_over_ssl_verify(self, tmp_path):
+        """
+        What it does: Verifies CA_BUNDLE_PATH overrides SSL_VERIFY when file exists.
+        Purpose: Ensure custom CA bundle is used even if SSL_VERIFY is false.
+        """
+        ca_file = tmp_path / "custom-ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+
+        print(f"Setup: Creating CA bundle at {ca_file}...")
+
+        with patch.dict(os.environ, {
+            "CA_BUNDLE_PATH": str(ca_file),
+            "SSL_VERIFY": "false",
+        }):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            result = config_module.get_httpx_verify_config()
+            print(f"get_httpx_verify_config(): {result}")
+            assert result == str(ca_file)
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ca_bundle_path_with_tilde_expansion(self, tmp_path):
+        """
+        What it does: Verifies CA_BUNDLE_PATH expands ~ to home directory.
+        Purpose: Ensure tilde paths work for CA bundle location.
+        """
+        ca_file = tmp_path / "root-ca.pem"
+        ca_file.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+
+        print(f"Setup: Creating CA bundle at {ca_file}...")
+
+        # expanduser() uses $HOME on POSIX, so we set it to tmp_path
+        with patch.dict(os.environ, {
+            "CA_BUNDLE_PATH": f"~/{ca_file.name}",
+            "HOME": str(tmp_path),
+        }):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            result = config_module.get_httpx_verify_config()
+            print(f"get_httpx_verify_config(): {result}")
+            assert result == str(ca_file)
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ca_bundle_path_nonexistent_falls_back(self):
+        """
+        What it does: Verifies a non-existent CA_BUNDLE_PATH falls back to SSL_VERIFY.
+        Purpose: Ensure graceful degradation when the path is invalid.
+        """
+        print("Setup: Setting CA_BUNDLE_PATH to nonexistent file, SSL_VERIFY=false...")
+
+        with patch.dict(os.environ, {
+            "CA_BUNDLE_PATH": "/nonexistent/path/to/ca.pem",
+            "SSL_VERIFY": "false",
+        }):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            # Should warn and fall back to SSL_VERIFY=False
+            import warnings
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                result = config_module.get_httpx_verify_config()
+                print(f"get_httpx_verify_config(): {result}")
+                assert result is False
+                # Verify a warning was emitted
+                assert len(w) == 1
+                assert "CA_BUNDLE_PATH" in str(w[0].message)
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_ca_bundle_path_nonexistent_with_verify_true(self):
+        """
+        What it does: Verifies fallback to True when path invalid and SSL_VERIFY=true.
+        Purpose: Ensure default verification still works after invalid path.
+        """
+        print("Setup: Setting CA_BUNDLE_PATH to nonexistent, SSL_VERIFY=true...")
+
+        with patch.dict(os.environ, {
+            "CA_BUNDLE_PATH": "/nonexistent/path/to/ca.pem",
+            "SSL_VERIFY": "true",
+        }):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            import warnings
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                result = config_module.get_httpx_verify_config()
+                print(f"get_httpx_verify_config(): {result}")
+                assert result is True
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+
+    def test_default_get_httpx_verify_config_returns_true(self):
+        """
+        What it does: Verifies get_httpx_verify_config() returns True by default.
+        Purpose: Ensure httpx uses default verification out of the box.
+        """
+        print("Setup: Mocking defaults for SSL settings...")
+
+        original_getenv = os.getenv
+
+        def mock_getenv(key, default=None):
+            if key in ("SSL_VERIFY", "CA_BUNDLE_PATH"):
+                return default
+            return original_getenv(key, default)
+
+        with patch.object(os, 'getenv', side_effect=mock_getenv):
+            import importlib
+            import kiro.config as config_module
+            importlib.reload(config_module)
+
+            result = config_module.get_httpx_verify_config()
+            print(f"get_httpx_verify_config(): {result}")
+            assert result is True
+
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)

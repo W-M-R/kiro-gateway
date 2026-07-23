@@ -27,7 +27,7 @@ Loads environment variables and provides typed access to them.
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -119,6 +119,33 @@ PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 #   VPN_PROXY_URL=http://user:password@proxy.company.com:8080
 #   VPN_PROXY_URL=192.168.1.100:8080  (defaults to http://)
 VPN_PROXY_URL: str = os.getenv("VPN_PROXY_URL", "")
+
+# ==================================================================================================
+# SSL/TLS Certificate Settings
+# ==================================================================================================
+
+# Whether to verify SSL/TLS certificates when connecting to Kiro API (default: true).
+#
+# Set to false ONLY in these scenarios:
+#   - Corporate networks with MITM (man-in-the-middle) proxies that re-sign HTTPS
+#     traffic with an internal CA not installed in the system trust store
+#   - Environments where the upstream certificate chain is incomplete
+#   - Debugging SSL issues
+#
+# WARNING: Disabling SSL verification removes transport security. Only disable if you
+# trust the network path between the gateway and the Kiro API.
+SSL_VERIFY: bool = os.getenv("SSL_VERIFY", "true").lower() in ("true", "1", "yes", "on")
+
+# Optional path to a custom CA bundle (PEM file) for verifying Kiro API certificates.
+#
+# Use this when:
+#   - A corporate MITM proxy uses a private root CA that you have as a PEM file
+#   - You want to pin a specific CA instead of using the system/certifi defaults
+#
+# When set to a valid file path, this takes precedence over SSL_VERIFY and enables
+# verification using the specified CA bundle. When unset, SSL_VERIFY controls behavior.
+# Example: CA_BUNDLE_PATH="/etc/ssl/certs/my-company-root-ca.pem"
+CA_BUNDLE_PATH: str = os.getenv("CA_BUNDLE_PATH", "")
 
 # ==================================================================================================
 # Kiro API Credentials
@@ -319,6 +346,22 @@ DEFAULT_MAX_INPUT_TOKENS: int = 200000
 # Descriptions longer than this limit will be moved to system prompt.
 # Set to 0 to disable (not recommended - will cause Kiro API errors).
 TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000"))
+
+# ==================================================================================================
+# Request Size Guard (Prevent Kiro API mid-stream disconnects)
+# ==================================================================================================
+
+# Maximum allowed request body size in KB.
+# When the serialized Kiro request exceeds this limit, the gateway returns 413 immediately
+# with a user-friendly message instead of letting Kiro API disconnect mid-stream.
+#
+# Why? Kiro API has an undocumented output limit. Large contexts (many messages) cause
+# the API to silently drop the TCP connection during streaming, leaving clients "stuck".
+# By rejecting oversized requests early, clients get a clear error and can /compact.
+#
+# Set to 0 to disable the check (not recommended).
+# Default: 900 KB (empirically, requests >1MB frequently trigger mid-stream disconnects)
+MAX_REQUEST_SIZE_KB: int = int(os.getenv("MAX_REQUEST_SIZE_KB", "900"))
 
 # ==================================================================================================
 # Truncation Recovery Settings
@@ -578,4 +621,45 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_httpx_verify_config() -> Union[bool, str]:
+    """
+    Return the appropriate `verify` value for httpx.AsyncClient based on SSL settings.
+    
+    Resolution order:
+    1. If CA_BUNDLE_PATH is set and points to an existing file → return that path
+       (enables verification using a custom CA bundle, e.g. corporate root CA)
+    2. Otherwise, if SSL_VERIFY is false → return False (disable verification)
+    3. Otherwise → return True (use httpx default: certifi CA bundle)
+    
+    Returns:
+        - str: path to a custom CA bundle file (when CA_BUNDLE_PATH is valid)
+        - False: when SSL verification is disabled
+        - True: when using default verification (httpx/certifi defaults)
+    
+    Examples:
+        >>> # With CA_BUNDLE_PATH="/path/to/ca.pem" (file exists)
+        >>> get_httpx_verify_config()
+        '/path/to/ca.pem'
+        >>> # With SSL_VERIFY=false
+        >>> get_httpx_verify_config()
+        False
+        >>> # Default
+        >>> get_httpx_verify_config()
+        True
+    """
+    if CA_BUNDLE_PATH:
+        ca_path = Path(CA_BUNDLE_PATH).expanduser()
+        if ca_path.is_file():
+            return str(ca_path)
+        # Path was set but file doesn't exist - fall back with a warning
+        import warnings
+        warnings.warn(
+            f"CA_BUNDLE_PATH='{CA_BUNDLE_PATH}' does not exist or is not a file; "
+            f"falling back to SSL_VERIFY={SSL_VERIFY}",
+            stacklevel=2,
+        )
+    
+    return True if SSL_VERIFY else False
 
