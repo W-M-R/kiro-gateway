@@ -49,6 +49,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,6 +79,7 @@ from kiro.config import (
     ACCOUNT_SYSTEM,
     ACCOUNTS_CONFIG_FILE,
     ACCOUNTS_STATE_FILE,
+    STATUS_SERVER_PORT,
     _warn_timeout_configuration,
     get_httpx_verify_config,
 )
@@ -87,6 +89,7 @@ from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
 from kiro.routes_anthropic import router as anthropic_router
+from kiro.status_server import create_status_app
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
 
@@ -509,19 +512,53 @@ async def lifespan(app: FastAPI):
         app.state.account_manager.save_state_periodically()
     )
     
+    # Start background task for periodic quota polling
+    quota_task = asyncio.create_task(
+        app.state.account_manager.poll_quota_periodically()
+    )
+    
     logger.info("Account system initialized successfully")
+    
+    # ==============================================================================
+    # Start Status Web Server (separate port)
+    # ==============================================================================
+    status_task = None
+    if STATUS_SERVER_PORT > 0:
+        try:
+            status_app = create_status_app(app.state.account_manager)
+            config = uvicorn.Config(
+                status_app,
+                host="0.0.0.0",
+                port=STATUS_SERVER_PORT,
+                log_config=UVICORN_LOG_CONFIG,
+                log_level="warning",
+            )
+            status_server = uvicorn.Server(config)
+            status_task = asyncio.create_task(status_server.serve())
+            logger.info(f"Status dashboard started on port {STATUS_SERVER_PORT}")
+        except Exception as e:
+            logger.warning(f"Failed to start status server: {e}")
+    else:
+        logger.info("Status server disabled (STATUS_SERVER_PORT=0)")
     
     yield
     
     # Graceful shutdown
     logger.info("Shutting down application...")
     
-    # Cancel background task
+    # Cancel background tasks
     save_task.cancel()
-    try:
-        await save_task
-    except asyncio.CancelledError:
-        pass
+    quota_task.cancel()
+    if status_task:
+        status_task.cancel()
+    
+    for task_name, task in [("save", save_task), ("quota", quota_task), ("status", status_task)]:
+        if task is None:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     
     # Final state save
     await app.state.account_manager._save_state()
@@ -640,6 +677,14 @@ Examples:
     )
     
     parser.add_argument(
+        "--status-port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help=f"Status dashboard port (default: {STATUS_SERVER_PORT}, env: STATUS_SERVER_PORT, 0 to disable)"
+    )
+    
+    parser.add_argument(
         "-v", "--version",
         action="version",
         version=f"%(prog)s {APP_VERSION}"
@@ -648,20 +693,20 @@ Examples:
     return parser.parse_args()
 
 
-def resolve_server_config(args: argparse.Namespace) -> tuple[str, int]:
+def resolve_server_config(args: argparse.Namespace) -> tuple[str, int, int]:
     """
     Resolve final server configuration using priority hierarchy.
     
     Priority (highest to lowest):
-    1. CLI arguments (--host, --port)
-    2. Environment variables (SERVER_HOST, SERVER_PORT)
-    3. Default values (0.0.0.0:8000)
+    1. CLI arguments (--host, --port, --status-port)
+    2. Environment variables (SERVER_HOST, SERVER_PORT, STATUS_SERVER_PORT)
+    3. Default values
     
     Args:
         args: Parsed CLI arguments
         
     Returns:
-        Tuple of (host, port) with resolved values
+        Tuple of (host, port, status_port) with resolved values
     """
     # Host resolution: CLI > ENV > Default
     if args.host is not None:
@@ -685,20 +730,28 @@ def resolve_server_config(args: argparse.Namespace) -> tuple[str, int]:
         final_port = DEFAULT_SERVER_PORT
         port_source = "default"
     
+    # Status port resolution: CLI > ENV
+    if args.status_port is not None:
+        final_status_port = args.status_port
+    else:
+        final_status_port = STATUS_SERVER_PORT
+    
     # Log configuration sources for transparency
     logger.debug(f"Host: {final_host} (from {host_source})")
     logger.debug(f"Port: {final_port} (from {port_source})")
+    logger.debug(f"Status port: {final_status_port}")
     
-    return final_host, final_port
+    return final_host, final_port, final_status_port
 
 
-def print_startup_banner(host: str, port: int) -> None:
+def print_startup_banner(host: str, port: int, status_port: int = 0) -> None:
     """
     Print a startup banner with server information.
     
     Args:
         host: Server host address
         port: Server port
+        status_port: Status dashboard port (0 = disabled)
     """
     # ANSI color codes
     GREEN = "\033[92m"
@@ -721,6 +774,9 @@ def print_startup_banner(host: str, port: int) -> None:
     print()
     print(f"  {DIM}API Docs:      {url}/docs{RESET}")
     print(f"  {DIM}Health Check:  {url}/health{RESET}")
+    if status_port > 0:
+        status_url = f"http://{display_host}:{status_port}"
+        print(f"  {CYAN}Status Dashboard: {status_url}{RESET}")
     print()
     print(f"  {DIM}{'─' * 48}{RESET}")
     print(f"  {WHITE}💬 Found a bug? Need help? Have questions?{RESET}")
@@ -743,10 +799,10 @@ if __name__ == "__main__":
     _warn_timeout_configuration()
     
     # Resolve final configuration with priority hierarchy
-    final_host, final_port = resolve_server_config(args)
+    final_host, final_port, final_status_port = resolve_server_config(args)
     
     # Print startup banner
-    print_startup_banner(final_host, final_port)
+    print_startup_banner(final_host, final_port, final_status_port)
     
     logger.info(f"Starting Uvicorn server on {final_host}:{final_port}...")
     

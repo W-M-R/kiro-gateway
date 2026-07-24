@@ -144,7 +144,7 @@ class TestResolveServerConfig:
         from main import resolve_server_config
         
         print("Setup: Creating args with host=127.0.0.1, port=9000...")
-        args = argparse.Namespace(host="127.0.0.1", port=9000)
+        args = argparse.Namespace(host="127.0.0.1", port=9000, status_port=None)
         
         print("Action: Calling resolve_server_config with CLI args...")
         # Even if env vars are set, CLI should win
@@ -152,7 +152,7 @@ class TestResolveServerConfig:
              patch('main.SERVER_PORT', 8000), \
              patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
              patch('main.DEFAULT_SERVER_PORT', 8000):
-            host, port = resolve_server_config(args)
+            host, port, _ = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
         print(f"Resolved port: {port}")
@@ -169,7 +169,7 @@ class TestResolveServerConfig:
         from main import resolve_server_config
         
         print("Setup: Creating args with host=None, port=None (no CLI args)...")
-        args = argparse.Namespace(host=None, port=None)
+        args = argparse.Namespace(host=None, port=None, status_port=None)
         
         print("Action: Calling resolve_server_config with env vars set...")
         # SERVER_HOST and SERVER_PORT are different from defaults
@@ -177,7 +177,7 @@ class TestResolveServerConfig:
              patch('main.SERVER_PORT', 3000), \
              patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
              patch('main.DEFAULT_SERVER_PORT', 8000):
-            host, port = resolve_server_config(args)
+            host, port, _ = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
         print(f"Resolved port: {port}")
@@ -194,7 +194,7 @@ class TestResolveServerConfig:
         from main import resolve_server_config
         
         print("Setup: Creating args with host=None, port=None...")
-        args = argparse.Namespace(host=None, port=None)
+        args = argparse.Namespace(host=None, port=None, status_port=None)
         
         print("Action: Calling resolve_server_config with defaults...")
         # SERVER_HOST and SERVER_PORT equal to defaults (no env override)
@@ -202,7 +202,7 @@ class TestResolveServerConfig:
              patch('main.SERVER_PORT', 8000), \
              patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
              patch('main.DEFAULT_SERVER_PORT', 8000):
-            host, port = resolve_server_config(args)
+            host, port, _ = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
         print(f"Resolved port: {port}")
@@ -219,14 +219,14 @@ class TestResolveServerConfig:
         from main import resolve_server_config
         
         print("Setup: Creating args with host='127.0.0.1', port=None...")
-        args = argparse.Namespace(host="127.0.0.1", port=None)
+        args = argparse.Namespace(host="127.0.0.1", port=None, status_port=None)
         
         print("Action: Calling resolve_server_config...")
         with patch('main.SERVER_HOST', '0.0.0.0'), \
              patch('main.SERVER_PORT', 9000), \
              patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
              patch('main.DEFAULT_SERVER_PORT', 8000):
-            host, port = resolve_server_config(args)
+            host, port, _ = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
         print(f"Resolved port: {port}")
@@ -243,14 +243,14 @@ class TestResolveServerConfig:
         from main import resolve_server_config
         
         print("Setup: Creating args with host=None, port=5000...")
-        args = argparse.Namespace(host=None, port=5000)
+        args = argparse.Namespace(host=None, port=5000, status_port=None)
         
         print("Action: Calling resolve_server_config...")
         with patch('main.SERVER_HOST', '192.168.1.1'), \
              patch('main.SERVER_PORT', 8000), \
              patch('main.DEFAULT_SERVER_HOST', '0.0.0.0'), \
              patch('main.DEFAULT_SERVER_PORT', 8000):
-            host, port = resolve_server_config(args)
+            host, port, _ = resolve_server_config(args)
         
         print(f"Resolved host: {host}")
         print(f"Resolved port: {port}")

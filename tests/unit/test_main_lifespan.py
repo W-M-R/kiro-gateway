@@ -385,6 +385,9 @@ class TestLifespanAccountManagerInit:
             
             async def save_state_periodically(self):
                 await asyncio.sleep(1000)
+            
+            async def poll_quota_periodically(self):
+                await asyncio.sleep(1000)
         
         with patch("main.AccountManager", MockAccountManager):
             with patch("main.httpx.AsyncClient") as mock_client_class:

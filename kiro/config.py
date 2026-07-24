@@ -30,6 +30,28 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 from dotenv import load_dotenv
 
+
+def _parse_str_list(raw: str, sep: str = ",") -> List[str]:
+    """
+    Parse a comma-separated string into a list of trimmed non-empty values.
+
+    Args:
+        raw: Raw environment variable string.
+        sep: Separator character (default comma).
+
+    Returns:
+        List of trimmed, non-empty strings. Empty list if raw is empty.
+
+    Examples:
+        >>> _parse_str_list("wangmingrong1, mazhuang ,")
+        ['wangmingrong1', 'mazhuang']
+        >>> _parse_str_list("")
+        []
+    """
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(sep) if item.strip()]
+
 # Load environment variables
 load_dotenv()
 
@@ -586,6 +608,49 @@ ACCOUNT_PROBABILISTIC_RETRY_CHANCE: float = float(os.getenv("ACCOUNT_PROBABILIST
 # Model cache TTL in seconds (12 hours)
 # Cache is refreshed only when account is used (not in background)
 ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
+
+# ==================================================================================================
+# Quota Polling Settings (Usage Limits Monitoring)
+# ==================================================================================================
+
+# Interval in seconds between GetUsageLimits API polls.
+# The quota API call does not consume chat credits, so polling is safe.
+# Default: 300 seconds (5 minutes)
+QUOTA_POLL_INTERVAL: int = int(os.getenv("QUOTA_POLL_INTERVAL", "300"))
+
+# Initial delay (seconds) before the first quota poll at startup.
+# Allows accounts to initialize before querying.
+# Default: 10 seconds
+QUOTA_POLL_INITIAL_DELAY: int = int(os.getenv("QUOTA_POLL_INITIAL_DELAY", "10"))
+
+# ==================================================================================================
+# Account Priority Settings (Load Balancing)
+# ==================================================================================================
+
+# Comma-separated list of account owner labels that should be used first
+# (drained) before falling back to quota-balanced selection.
+#
+# The owner label is the parent directory name of a credential file when
+# scanning recursively (e.g. kiro-cli-db-file/wangmingrong1/data.sqlite3
+# → owner "wangmingrong1").
+#
+# Priority accounts are tried in listed order. When all priority accounts
+# are exhausted (quota depleted or unhealthy), the system falls back to
+# balancing mode: select the account with the most remaining quota.
+#
+# Example: ACCOUNT_PRIORITY=wangmingrong1,anjiahao
+# Default: empty (pure quota-balanced mode)
+ACCOUNT_PRIORITY: List[str] = _parse_str_list(os.getenv("ACCOUNT_PRIORITY", ""))
+
+# ==================================================================================================
+# Status Server Settings (Web Dashboard)
+# ==================================================================================================
+
+# Port for the independent status web server (HTML dashboard + JSON API).
+# This runs alongside the main API server and does not interfere with it.
+# Set to 0 to disable the status server.
+# Default: 19998
+STATUS_SERVER_PORT: int = int(os.getenv("STATUS_SERVER_PORT", "19998"))
 
 # ==================================================================================================
 # State Persistence Settings

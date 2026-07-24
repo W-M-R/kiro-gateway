@@ -40,7 +40,9 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import get_httpx_verify_config
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import get_kiro_mcp_headers
 
 # Import debug_logger
 try:
@@ -126,6 +128,10 @@ async def call_kiro_mcp_api(
     tool_use_id = f"srvtoolu_{uuid.uuid4().hex[:32]}"
     
     # Build MCP request
+    # profileArn is REQUIRED at the top level of the MCP request body — without
+    # it the MCP endpoint rejects the call with 400 "profileArn is required for
+    # this request." (unlike GenerateAssistantResponse where it sits in the
+    # payload, MCP is JSON-RPC and expects profileArn alongside the RPC fields).
     mcp_request = {
         "id": request_id,
         "jsonrpc": "2.0",
@@ -133,8 +139,10 @@ async def call_kiro_mcp_api(
         "params": {
             "name": "web_search",
             "arguments": {"query": query}
-        }
+        },
     }
+    if auth_manager.profile_arn:
+        mcp_request["profileArn"] = auth_manager.profile_arn
     
     # Log MCP request
     try:
@@ -147,21 +155,23 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+        # Headers: MCP requires the full Kiro client header set (User-Agent,
+        # x-amz-user-agent, x-amzn-kiro-agent-mode, amz-sdk-*) to authenticate;
+        # with only Authorization the endpoint returns 403. Content-Type is
+        # application/json (not the x-amz-json-1.0 used by streaming), and there
+        # is no x-amz-target since MCP is a separate JSON-RPC endpoint.
+        headers = get_kiro_mcp_headers(auth_manager, token)
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0, verify=get_httpx_verify_config()) as client:
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(
+                    f"MCP API error: {response.status_code}, body={response.text[:300]}"
+                )
                 return None, None
             
             mcp_response = response.json()

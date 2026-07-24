@@ -58,35 +58,94 @@ def get_machine_fingerprint() -> str:
         return hashlib.sha256(b"default-kiro-gateway").hexdigest()
 
 
+# User-Agent strings emulating the Kiro IDE client for API compatibility.
+# Shared by all Kiro API requests (GenerateAssistantResponse and MCP).
+_KIRO_USER_AGENT_TEMPLATE = (
+    "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 "
+    "api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}"
+)
+_KIRO_X_AMZ_USER_AGENT_TEMPLATE = "aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}"
+
+
+def _build_kiro_user_agent_headers(fingerprint: str) -> Dict[str, str]:
+    """
+    Build User-Agent and x-amz-user-agent headers for Kiro API requests.
+
+    Centralises client-identification header construction so that
+    GenerateAssistantResponse and MCP requests stay consistent.
+
+    Args:
+        fingerprint: Machine fingerprint for client identification.
+
+    Returns:
+        Dict with ``User-Agent`` and ``x-amz-user-agent`` keys.
+    """
+    return {
+        "User-Agent": _KIRO_USER_AGENT_TEMPLATE.format(fingerprint=fingerprint),
+        "x-amz-user-agent": _KIRO_X_AMZ_USER_AGENT_TEMPLATE.format(fingerprint=fingerprint),
+    }
+
+
 def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
     """
-    Builds headers for Kiro API requests.
-    
+    Builds headers for Kiro GenerateAssistantResponse API requests.
+
     Includes all necessary headers for authentication and identification:
     - Authorization with Bearer token
     - User-Agent with fingerprint
-    - AWS CodeWhisperer specific headers
-    
+    - AWS CodeWhisperer specific headers (x-amz-target, opt-out, agent mode)
+
     Args:
         auth_manager: Authentication manager for obtaining fingerprint
         token: Access token for authorization
-    
+
     Returns:
         Dictionary with headers for HTTP request
     """
-    fingerprint = auth_manager.fingerprint
-    
-    return {
+    headers: Dict[str, str] = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/x-amz-json-1.0",
         "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-        "User-Agent": f"aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}",
-        "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}",
         "x-amzn-codewhisperer-optout": "true",
         "x-amzn-kiro-agent-mode": "vibe",
         "amz-sdk-invocation-id": str(uuid.uuid4()),
         "amz-sdk-request": "attempt=1; max=3",
     }
+    headers.update(_build_kiro_user_agent_headers(auth_manager.fingerprint))
+    return headers
+
+
+def get_kiro_mcp_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
+    """
+    Builds headers for Kiro MCP API requests (e.g. web_search tool).
+
+    MCP requests differ from GenerateAssistantResponse requests:
+    - Content-Type: ``application/json`` (not ``application/x-amz-json-1.0``)
+    - No ``x-amz-target`` header (MCP is a separate JSON-RPC endpoint)
+    - ``x-amzn-codewhisperer-optout: false`` (MCP opt-in semantics)
+
+    Otherwise shares User-Agent, x-amz-user-agent, x-amzn-kiro-agent-mode,
+    and amz-sdk-* headers to authenticate and identify the client. Missing
+    these headers causes the MCP endpoint to reject requests with 403
+    "User is not authorized to make this call".
+
+    Args:
+        auth_manager: Authentication manager for obtaining fingerprint
+        token: Access token for authorization
+
+    Returns:
+        Dictionary with headers for MCP HTTP request
+    """
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-amzn-codewhisperer-optout": "false",
+        "x-amzn-kiro-agent-mode": "vibe",
+        "amz-sdk-invocation-id": str(uuid.uuid4()),
+        "amz-sdk-request": "attempt=1; max=3",
+    }
+    headers.update(_build_kiro_user_agent_headers(auth_manager.fingerprint))
+    return headers
 
 
 def generate_completion_id() -> str:

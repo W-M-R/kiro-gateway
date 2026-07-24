@@ -31,3 +31,10 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Credential databases (contains tokens - DO NOT commit)
+kiro-cli-db-file/
+*.sqlite3
+
+# Runtime logs
+nohup.out

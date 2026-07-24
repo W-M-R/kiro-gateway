@@ -86,9 +86,12 @@ def setup_test_environment(tmp_path_factory):
     import kiro.config
     original_creds_file = kiro.config.ACCOUNTS_CONFIG_FILE
     original_state_file = kiro.config.ACCOUNTS_STATE_FILE
+    original_status_port = kiro.config.STATUS_SERVER_PORT
     
     kiro.config.ACCOUNTS_CONFIG_FILE = str(creds_file)
     kiro.config.ACCOUNTS_STATE_FILE = str(tmp_dir / "state.json")
+    # Disable status server in tests to avoid port conflicts
+    kiro.config.STATUS_SERVER_PORT = 0
     
     print(f"✅ Test credentials: {creds_file}")
     print(f"✅ Test state: {tmp_dir / 'state.json'}")
@@ -98,6 +101,7 @@ def setup_test_environment(tmp_path_factory):
     # Restore original paths
     kiro.config.ACCOUNTS_CONFIG_FILE = original_creds_file
     kiro.config.ACCOUNTS_STATE_FILE = original_state_file
+    kiro.config.STATUS_SERVER_PORT = original_status_port
     
     print("🧹 Test environment cleaned up")
 

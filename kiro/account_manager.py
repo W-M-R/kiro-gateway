@@ -58,7 +58,11 @@ from kiro.config import (
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
+    QUOTA_POLL_INTERVAL,
+    QUOTA_POLL_INITIAL_DELAY,
+    ACCOUNT_PRIORITY,
 )
+from kiro.quota import QuotaInfo, query_quota
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
@@ -145,6 +149,8 @@ class Account:
     
     Attributes:
         id: Unique identifier (path to credentials file)
+        owner: Human-readable owner label (parent directory name when
+            loaded from a recursive folder scan, or a hash for refresh tokens)
         auth_manager: Authentication manager (lazy initialized)
         model_cache: Model metadata cache (lazy initialized)
         model_resolver: Model resolver (lazy initialized)
@@ -152,8 +158,10 @@ class Account:
         last_failure_time: Timestamp of last failure
         models_cached_at: Timestamp of last model cache update
         stats: Usage statistics
+        quota_info: Latest quota information (lazy initialized by poller)
     """
     id: str
+    owner: str = ""
     auth_manager: Optional[KiroAuthManager] = None
     model_cache: Optional[ModelInfoCache] = None
     model_resolver: Optional[ModelResolver] = None
@@ -161,6 +169,7 @@ class Account:
     last_failure_time: float = 0.0
     models_cached_at: float = 0.0
     stats: AccountStats = field(default_factory=AccountStats)
+    quota_info: Optional[QuotaInfo] = None
 
 
 @dataclass
@@ -270,45 +279,25 @@ class AccountManager:
             # Handle folder scanning for json/sqlite types
             expanded_path = Path(path).expanduser()
             if expanded_path.is_dir():
-                logger.info(f"Scanning folder for credentials: {path}")
+                recursive = entry.get("recursive", False)
+                logger.info(f"Scanning folder for credentials: {path} (recursive={recursive})")
                 for file_path in expanded_path.iterdir():
-                    if not file_path.is_file():
+                    # Non-recursive: only top-level files
+                    if not recursive and not file_path.is_file():
                         continue
                     
-                    # Validate file before adding as account
-                    account_id = str(file_path.resolve())
-                    is_valid = False
+                    # Recursive: descend into subdirectories looking for credential files
+                    if recursive and file_path.is_dir():
+                        for sub_file in file_path.iterdir():
+                            if not sub_file.is_file():
+                                continue
+                            self._try_add_credential_file(sub_file, cred_type, entry)
+                        continue
                     
-                    # Try JSON validation
-                    if cred_type == "json":
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                                # Valid if has refreshToken or clientId
-                                if 'refreshToken' in data or 'clientId' in data:
-                                    is_valid = True
-                        except Exception as e:
-                            logger.warning(f"Invalid JSON credentials file {file_path.name}: {e}")
+                    if recursive and not file_path.is_file():
+                        continue
                     
-                    # Try SQLite validation
-                    elif cred_type == "sqlite":
-                        try:
-                            import sqlite3
-                            conn = sqlite3.connect(str(file_path))
-                            cursor = conn.cursor()
-                            # Check if auth_kv table exists
-                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_kv'")
-                            if cursor.fetchone():
-                                is_valid = True
-                            conn.close()
-                        except Exception as e:
-                            logger.warning(f"Invalid SQLite database file {file_path.name}: {e}")
-                    
-                    if is_valid:
-                        self._accounts[account_id] = Account(id=account_id)
-                        logger.debug(f"Added account from folder: {account_id}")
-                    else:
-                        logger.warning(f"Skipping invalid credentials file: {file_path.name}")
+                    self._try_add_credential_file(file_path, cred_type, entry)
             elif expanded_path.is_file() or cred_type == "refresh_token":
                 # Single file or refresh_token type
                 if cred_type == "refresh_token":
@@ -324,6 +313,54 @@ class AccountManager:
                 logger.warning(f"Credential path not found: {path}")
         
         logger.info(f"Loaded {len(self._accounts)} account(s) from credentials")
+    
+    def _try_add_credential_file(self, file_path: Path, cred_type: str, entry: Dict) -> None:
+        """
+        Validate and register a single credential file as an account.
+        
+        Determines the owner label from the parent directory name when the
+        file is nested inside a scanned folder (e.g.
+        kiro-cli-db-file/wangmingrong1/data.sqlite3 → owner "wangmingrong1").
+        
+        Args:
+            file_path: Path to the credential file.
+            cred_type: Credential type ("json" or "sqlite").
+            entry: The credentials.json entry (for potential future use).
+        """
+        account_id = str(file_path.resolve())
+        is_valid = False
+        
+        # Try JSON validation
+        if cred_type == "json":
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if 'refreshToken' in data or 'clientId' in data:
+                        is_valid = True
+            except Exception as e:
+                logger.warning(f"Invalid JSON credentials file {file_path.name}: {e}")
+        
+        # Try SQLite validation
+        elif cred_type == "sqlite":
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(file_path))
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_kv'")
+                if cursor.fetchone():
+                    is_valid = True
+                conn.close()
+            except Exception as e:
+                logger.warning(f"Invalid SQLite database file {file_path.name}: {e}")
+        
+        if is_valid:
+            # Derive owner label from parent directory name (for recursive scans)
+            # e.g. kiro-cli-db-file/wangmingrong1/data.sqlite3 → "wangmingrong1"
+            owner = file_path.parent.name
+            self._accounts[account_id] = Account(id=account_id, owner=owner)
+            logger.debug(f"Added account from folder: {account_id} (owner={owner})")
+        else:
+            logger.warning(f"Skipping invalid credentials file: {file_path.name}")
     
     async def load_state(self) -> None:
         """
@@ -354,9 +391,32 @@ class AccountManager:
             for account_id, data in state_data.get("accounts", {}).items():
                 if account_id in self._accounts:
                     account = self._accounts[account_id]
+                    # Restore owner if not already set (from credentials.json)
+                    if not account.owner:
+                        account.owner = data.get("owner", "")
                     account.failures = data.get("failures", 0)
                     account.last_failure_time = data.get("last_failure_time", 0.0)
                     account.models_cached_at = data.get("models_cached_at", 0.0)
+                    
+                    # Restore quota info if present
+                    quota_data = data.get("quota_info")
+                    if quota_data:
+                        account.quota_info = QuotaInfo(
+                            owner=account.owner,
+                            account_id=account_id,
+                            subscription=quota_data.get("subscription", ""),
+                            current_usage=quota_data.get("current_usage", 0),
+                            usage_limit=quota_data.get("usage_limit", 0),
+                            current_overages=quota_data.get("current_overages", 0),
+                            overage_cap=quota_data.get("overage_cap", 0),
+                            free_remaining=quota_data.get("free_remaining", 0),
+                            overage_remaining=quota_data.get("overage_remaining", 0),
+                            total_remaining=quota_data.get("total_remaining", 0),
+                            next_reset_epoch=quota_data.get("next_reset_epoch", 0.0),
+                            is_exhausted=quota_data.get("is_exhausted", True),
+                            last_updated=quota_data.get("last_updated", 0.0),
+                            last_error=quota_data.get("last_error"),
+                        )
                     
                     stats_data = data.get("stats", {})
                     account.stats = AccountStats(
@@ -380,9 +440,11 @@ class AccountManager:
             "current_account_index": self._current_account_index,
             "accounts": {
                 account_id: {
+                    "owner": account.owner,
                     "failures": account.failures,
                     "last_failure_time": account.last_failure_time,
                     "models_cached_at": account.models_cached_at,
+                    "quota_info": account.quota_info.to_dict() if account.quota_info else None,
                     "stats": {
                         "total_requests": account.stats.total_requests,
                         "successful_requests": account.stats.successful_requests,
@@ -642,16 +704,56 @@ class AccountManager:
         finally:
             await http_client.close()
     
+    def _is_account_available(self, account: Account) -> bool:
+        """
+        Check if an account is available for use based on quota.
+        
+        An account is considered unavailable if quota_info exists and
+        shows the account is exhausted (total_remaining <= 0).
+        If quota_info is None (not yet polled), the account is assumed
+        available — we don't block on missing data.
+        
+        Args:
+            account: Account to check.
+        
+        Returns:
+            True if account has quota remaining (or quota unknown).
+        """
+        if account.quota_info is None:
+            return True
+        return not account.quota_info.is_exhausted
+    
+    def _get_quota_remaining(self, account: Account) -> int:
+        """
+        Get the remaining quota for an account, for load-balancing ordering.
+        
+        Returns a very large number if quota is unknown (so unknown-quota
+        accounts are tried first during balancing — they haven't been
+        confirmed exhausted yet).
+        
+        Args:
+            account: Account to check.
+        
+        Returns:
+            Remaining total credits, or a large sentinel if unknown.
+        """
+        if account.quota_info is None:
+            return 10 ** 12
+        return account.quota_info.total_remaining
+    
     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
         """
-        Get next available account for model (Circuit Breaker + Sticky).
+        Get next available account (Priority + Quota-Balanced + Circuit Breaker).
         
-        Implements:
-        - Sticky behavior (prefer successful account)
-        - Circuit Breaker with exponential backoff
-        - Probabilistic retry for "dead" accounts (10%)
-        - TTL-based model cache refresh
-        - Exclusion of already-tried accounts in current failover loop
+        Selection strategy (in order):
+        1. Priority accounts: try accounts listed in ACCOUNT_PRIORITY (by owner)
+           in listed order. Use the first that is healthy and has quota.
+        2. Balanced fallback: if no priority account is available, select the
+           account with the most remaining quota (descending sort).
+        3. If all accounts exhausted or unhealthy: return None.
+        
+        Each candidate also passes the Circuit Breaker (exponential backoff
+        with probabilistic retry) and lazy initialization checks.
         
         Args:
             model: Model name (will be normalized)
@@ -661,24 +763,20 @@ class AccountManager:
             Account object or None if no accounts available
         """
         async with self._lock:
-            # Special case: single account - bypass Circuit Breaker
-            # Circuit Breaker is meaningless for single account - user should see real Kiro API errors
-            # instead of generic "Account unavailable" after cooldown kicks in
+            # Special case: single account - bypass Circuit Breaker and quota checks
+            # User should see real Kiro API errors instead of generic "Account unavailable"
             if len(self._accounts) == 1:
                 account_id = list(self._accounts.keys())[0]
                 account = self._accounts[account_id]
                 
-                # Skip if already tried in current failover loop
                 if exclude_accounts and account_id in exclude_accounts:
                     return None
                 
-                # Lazy initialization if needed
                 if account.auth_manager is None:
                     success = await self._initialize_account(account_id)
                     if not success:
                         return None
                 
-                # Check TTL and refresh if needed
                 if account.models_cached_at > 0:
                     age = time.time() - account.models_cached_at
                     if age > ACCOUNT_CACHE_TTL:
@@ -686,53 +784,64 @@ class AccountManager:
                             await self._refresh_account_models(account_id)
                         except Exception as e:
                             logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                # # Validate model availability
-                # if account.model_resolver:
-                #     normalized_model = normalize_model_name(model)
-                #     available_models = account.model_resolver.get_available_models()
-                #     if normalized_model not in available_models:
-                #         return None
                 
-                # Always return single account (ignore cooldown/failures)
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
                 return account
             
-            # Multi-account logic: GLOBAL sticky
-            normalized_model = normalize_model_name(model)
+            # Multi-account: build candidate list with priority + quota ordering
+            all_accounts = list(self._accounts.values())
             
-            # ALWAYS start from GLOBAL index (one current account for ALL models)
-            start_index = self._current_account_index
+            # Phase 1: Priority accounts (drain first)
+            priority_candidates: List[Account] = []
+            balanced_candidates: List[Account] = []
             
-            # ALWAYS iterate over ALL accounts
-            all_account_ids = list(self._accounts.keys())
-            
-            for i in range(len(all_account_ids)):
-                current_index = (start_index + i) % len(all_account_ids)
-                account_id = all_account_ids[current_index]
-                account = self._accounts[account_id]
-                
-                # Skip accounts already tried in current failover loop
-                if exclude_accounts and account_id in exclude_accounts:
+            for account in all_accounts:
+                # Skip excluded accounts
+                if exclude_accounts and account.id in exclude_accounts:
                     continue
+                
+                # Skip exhausted accounts (quota depleted)
+                if not self._is_account_available(account):
+                    logger.debug(f"Skipping exhausted account: {account.owner}")
+                    continue
+                
+                if account.owner in ACCOUNT_PRIORITY:
+                    priority_candidates.append(account)
+                else:
+                    balanced_candidates.append(account)
+            
+            # Sort priority candidates by their position in ACCOUNT_PRIORITY
+            priority_candidates.sort(
+                key=lambda a: ACCOUNT_PRIORITY.index(a.owner) if a.owner in ACCOUNT_PRIORITY else len(ACCOUNT_PRIORITY)
+            )
+            
+            # Sort balanced candidates by remaining quota (descending = most remaining first)
+            balanced_candidates.sort(key=lambda a: self._get_quota_remaining(a), reverse=True)
+            
+            # Combined candidate order: priority first, then balanced
+            ordered_candidates = priority_candidates + balanced_candidates
+            
+            if not ordered_candidates:
+                logger.warning("No available accounts: all exhausted or excluded")
+                return None
+            
+            # Try candidates in order, applying Circuit Breaker + lazy init
+            for account in ordered_candidates:
+                account_id = account.id
                 
                 # Check Circuit Breaker (Half-Open state with exponential backoff)
                 if account.failures > 0:
                     time_since_failure = time.time() - account.last_failure_time
                     
-                    # Exponential backoff: base * 2^(failures - 1), capped at MAX_MULTIPLIER
-                    # 1 failure: 60s, 2: 120s, 3: 240s, ..., 12+: 86400s (1 day cap)
                     backoff_multiplier = min(2 ** (account.failures - 1), ACCOUNT_MAX_BACKOFF_MULTIPLIER)
                     effective_timeout = ACCOUNT_RECOVERY_TIMEOUT * backoff_multiplier
                     
                     if time_since_failure < effective_timeout:
-                        # Probabilistic retry (10% chance)
                         if random.random() > ACCOUNT_PROBABILISTIC_RETRY_CHANCE:
                             continue
                         else:
-                            logger.info(f"Probabilistic retry for broken account {account_id}")
+                            logger.info(f"Probabilistic retry for broken account {account.owner}")
                     else:
-                        # Half-Open: recovery timeout passed
-                        logger.info(f"Half-Open state for {account_id} (recovery timeout passed, effective={effective_timeout}s)")
+                        logger.info(f"Half-Open state for {account.owner} (recovery timeout passed, effective={effective_timeout}s)")
                 
                 # Lazy initialization
                 if account.auth_manager is None:
@@ -750,13 +859,9 @@ class AccountManager:
                             await self._refresh_account_models(account_id)
                         except Exception as e:
                             logger.warning(f"Failed to refresh models for {account_id}: {e}")
-                # # Check if model is available on this account
-                # available_models = account.model_resolver.get_available_models()
-                # if normalized_model not in available_models:
-                #     continue
                 
-                # No model validation - let Kiro API decide (gateway, not gatekeeper)
                 # Account is suitable!
+                logger.debug(f"Selected account: {account.owner} (quota_remaining={self._get_quota_remaining(account)})")
                 return account
             
             # All accounts unavailable
@@ -895,3 +1000,101 @@ class AccountManager:
             if account.model_resolver:
                 all_models.update(account.model_resolver.get_available_models())
         return sorted(all_models)
+    
+    def get_all_quota_info(self) -> List[QuotaInfo]:
+        """
+        Collect quota info from all accounts for status reporting.
+        
+        Returns QuotaInfo for each account that has been polled.
+        Accounts that haven't been polled yet are not included.
+        
+        Returns:
+            List of QuotaInfo objects, sorted by owner name.
+        """
+        result = []
+        for account in self._accounts.values():
+            if account.quota_info is not None:
+                result.append(account.quota_info)
+        result.sort(key=lambda q: q.owner)
+        return result
+    
+    def get_account_owners(self) -> List[str]:
+        """
+        Get all account owner labels.
+        
+        Returns:
+            Sorted list of owner labels.
+        """
+        return sorted(a.owner for a in self._accounts.values() if a.owner)
+    
+    async def poll_quota_once(self) -> None:
+        """
+        Query quota for all accounts (single poll cycle).
+        
+        Ensures every account is initialized (lazy init) before querying,
+        so that quota data is available for all accounts — not just the
+        one selected at startup. Does not acquire the main lock during
+        HTTP queries (only during state updates) to avoid blocking
+        request handling.
+        """
+        # Collect all accounts (snapshot under lock)
+        async with self._lock:
+            all_accounts = list(self._accounts.items())
+        
+        if not all_accounts:
+            return
+        
+        logger.debug(f"Polling quota for {len(all_accounts)} account(s)")
+        
+        # Initialize uninitialized accounts so we can query their quota
+        for account_id, account in all_accounts:
+            if account.auth_manager is None:
+                logger.info(f"Initializing account for quota poll: {account.owner or account_id}")
+                try:
+                    success = await self._initialize_account(account_id)
+                    if not success:
+                        logger.warning(f"Failed to initialize {account.owner} for quota poll")
+                except Exception as e:
+                    logger.warning(f"Error initializing {account.owner} for quota poll: {e}")
+        
+        # Re-collect initialized accounts
+        async with self._lock:
+            to_query = [
+                (account_id, account)
+                for account_id, account in self._accounts.items()
+                if account.auth_manager is not None
+            ]
+        
+        # Query each account (no lock held during HTTP)
+        for account_id, account in to_query:
+            owner = account.owner or account_id
+            try:
+                quota_info = await query_quota(account.auth_manager, owner, account_id)
+                async with self._lock:
+                    if account_id in self._accounts:
+                        self._accounts[account_id].quota_info = quota_info
+                        self._dirty = True
+                    if quota_info.is_exhausted:
+                        logger.warning(f"Account {owner} quota exhausted: {quota_info.total_remaining} remaining")
+            except Exception as e:
+                logger.error(f"Failed to poll quota for {owner}: {e}")
+        
+        logger.debug("Quota poll cycle complete")
+    
+    async def poll_quota_periodically(self) -> None:
+        """
+        Background task for periodic quota polling.
+        
+        Waits QUOTA_POLL_INITIAL_DELAY seconds before first poll, then
+        polls every QUOTA_POLL_INTERVAL seconds. Runs indefinitely.
+        """
+        logger.info(f"Quota poller started: initial_delay={QUOTA_POLL_INITIAL_DELAY}s, interval={QUOTA_POLL_INTERVAL}s")
+        await asyncio.sleep(QUOTA_POLL_INITIAL_DELAY)
+        
+        while True:
+            try:
+                await self.poll_quota_once()
+            except Exception as e:
+                logger.error(f"Quota poll cycle error: {e}")
+            
+            await asyncio.sleep(QUOTA_POLL_INTERVAL)
