@@ -59,6 +59,58 @@ class TestQuotaInfoDataclass:
         assert d["is_exhausted"] is False
         assert "next_reset_iso" in d
 
+    def test_to_dict_exposes_is_quota_unknown(self):
+        """to_dict must expose is_quota_unknown so clients can tell failure apart."""
+        ok = QuotaInfo(owner="t", account_id="/p", total_remaining=10, is_exhausted=False)
+        failed = QuotaInfo(owner="t", account_id="/p", is_exhausted=True, last_error="HTTP 500")
+        assert ok.to_dict()["is_quota_unknown"] is False
+        assert failed.to_dict()["is_quota_unknown"] is True
+
+
+class TestIsQuotaUnknown:
+    """
+    Tests for the is_quota_unknown property.
+
+    A failed GetUsageLimits call returns is_exhausted=True as a placeholder.
+    is_quota_unknown distinguishes that from genuine exhaustion so callers do
+    not fail closed and reject traffic while accounts are actually healthy.
+    """
+
+    def test_false_when_query_succeeded(self):
+        """Successful query (no last_error) means quota figures are trustworthy."""
+        info = QuotaInfo(owner="t", account_id="/p", total_remaining=500, is_exhausted=False)
+        assert info.is_quota_unknown is False
+
+    def test_false_for_genuine_exhaustion(self):
+        """A successful query reporting zero quota is real exhaustion, not unknown."""
+        info = QuotaInfo(owner="t", account_id="/p", total_remaining=0, is_exhausted=True)
+        assert info.is_quota_unknown is False
+
+    def test_true_when_query_failed(self):
+        """Any last_error means the figures are meaningless."""
+        info = QuotaInfo(owner="t", account_id="/p", is_exhausted=True, last_error="HTTP 500")
+        assert info.is_quota_unknown is True
+
+    def test_default_quotainfo_is_not_unknown(self):
+        """A bare QuotaInfo has no error, so quota counts as known (exhausted)."""
+        info = QuotaInfo(owner="t", account_id="/p")
+        assert info.is_quota_unknown is False
+        assert info.is_exhausted is True
+
+    def test_query_quota_failure_yields_unknown(self):
+        """
+        Integration with query_quota's failure contract: parse a failure-shaped
+        QuotaInfo exactly as query_quota builds it.
+        """
+        failure = QuotaInfo(
+            owner="alice",
+            account_id="/a",
+            is_exhausted=True,
+            last_updated=123.0,
+            last_error="ConnectTimeout: quota host unreachable",
+        )
+        assert failure.is_quota_unknown is True
+
 
 class TestParseUsageResponse:
     """Tests for parse_usage_response function."""

@@ -14,6 +14,7 @@ Tests the AccountManager class that manages multiple Kiro accounts with:
 import asyncio
 import json
 import pytest
+import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -167,6 +168,228 @@ class TestAccountManagerLoadCredentials:
         
         assert len(manager._accounts) == 1
         assert str(Path(temp_sqlite_db).resolve()) in manager._accounts
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_sqlite_with_explicit_owner(self, tmp_path, temp_sqlite_db):
+        """
+        Test loading a single sqlite credential with an explicit owner label.
+
+        What it does: Loads a type=sqlite entry containing an "owner" field.
+        Purpose: Verify the explicit owner is stored on the Account (used by
+        ACCOUNT_PRIORITY and the status dashboard) instead of being empty.
+        """
+        print("\n=== Test: load_credentials sqlite with explicit owner ===")
+
+        creds_file = tmp_path / "credentials.json"
+        credentials = [
+            {
+                "type": "sqlite",
+                "path": temp_sqlite_db,
+                "owner": "alice",
+                "enabled": True,
+            }
+        ]
+        creds_file.write_text(json.dumps(credentials))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+        await manager.load_credentials()
+
+        account_id = str(Path(temp_sqlite_db).resolve())
+        assert account_id in manager._accounts
+        assert manager._accounts[account_id].owner == "alice"
+        print(f"✓ Explicit owner stored: {manager._accounts[account_id].owner}")
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_single_file_derives_owner_from_parent_dir(self, tmp_path):
+        """
+        Test that a single-file sqlite entry without "owner" derives it from the
+        parent directory name.
+
+        What it does: Loads a type=sqlite entry pointing at
+        <tmp>/wangmingrong1/data.sqlite3 with no "owner" field.
+        Purpose: Verify the documented KIRO_CLI_DB contract ("owner is optional;
+        when omitted it is derived from the parent directory name") and keep
+        single-file behavior consistent with folder scanning. Without derivation
+        the owner would fall back to the full path in quota polling and the
+        status dashboard.
+        """
+        print("\n=== Test: single file derives owner from parent dir ===")
+
+        account_dir = tmp_path / "wangmingrong1"
+        account_dir.mkdir()
+        db_path = account_dir / "data.sqlite3"
+
+        conn = sqlite3.connect(str(db_path))
+        conn.cursor().execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "sqlite", "path": str(db_path), "enabled": True}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+        await manager.load_credentials()
+
+        account_id = str(db_path.resolve())
+        assert account_id in manager._accounts
+        assert manager._accounts[account_id].owner == "wangmingrong1"
+        print(f"✓ Owner derived from parent dir: {manager._accounts[account_id].owner}")
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_duplicate_path_warns_and_collapses(self, tmp_path):
+        """
+        Test that two entries pointing at the same file collapse with a warning.
+
+        What it does: Configures the same sqlite path twice with different owners.
+        Purpose: Account identity is the resolved path, so duplicates collapse into
+        one account. Verify the last owner wins and the user is warned instead of
+        silently losing an entry.
+        """
+        print("\n=== Test: duplicate credential path warns and collapses ===")
+
+        db_path = tmp_path / "data.sqlite3"
+        conn = sqlite3.connect(str(db_path))
+        conn.cursor().execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "sqlite", "path": str(db_path), "owner": "alice"},
+            {"type": "sqlite", "path": str(db_path), "owner": "bob"},
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+        with patch("kiro.account_manager.logger") as mock_logger:
+            await manager.load_credentials()
+            warnings_logged = [str(c) for c in mock_logger.warning.call_args_list]
+
+        assert len(manager._accounts) == 1
+        account_id = str(db_path.resolve())
+        assert manager._accounts[account_id].owner == "bob"
+        assert any("Duplicate credential detected" in w for w in warnings_logged), \
+            f"Expected duplicate warning, got: {warnings_logged}"
+        print("✓ Duplicate collapsed to 1 account with warning")
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_duplicate_refresh_token_warns(self, tmp_path):
+        """
+        Test that two identical refresh tokens collapse with a warning.
+
+        What it does: Configures the same refresh_token twice with different owners.
+        Purpose: refresh_token identity is a deterministic hash of the token, so
+        duplicates must collapse and warn rather than silently drop an entry.
+        """
+        print("\n=== Test: duplicate refresh_token warns ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "same_token", "owner": "x"},
+            {"type": "refresh_token", "refresh_token": "same_token", "owner": "y"},
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+        with patch("kiro.account_manager.logger") as mock_logger:
+            await manager.load_credentials()
+            warnings_logged = [str(c) for c in mock_logger.warning.call_args_list]
+
+        assert len(manager._accounts) == 1
+        account = list(manager._accounts.values())[0]
+        assert account.owner == "y"
+        assert any("Duplicate credential detected" in w for w in warnings_logged), \
+            f"Expected duplicate warning, got: {warnings_logged}"
+        print("✓ Duplicate refresh_token collapsed with warning")
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_refresh_token_accepts_owner(self, tmp_path):
+        """
+        Test that a refresh_token entry honors an explicit owner label.
+
+        What it does: Loads a type=refresh_token entry containing "owner".
+        Purpose: refresh_token accounts have no path to derive a label from, so the
+        explicit owner must be preserved for ACCOUNT_PRIORITY and the dashboard.
+        """
+        print("\n=== Test: refresh_token accepts explicit owner ===")
+
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "refresh_token", "refresh_token": "tok_abc", "owner": "carol"}
+        ]))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+        await manager.load_credentials()
+
+        assert len(manager._accounts) == 1
+        account = list(manager._accounts.values())[0]
+        assert account.id.startswith("refresh_token_")
+        assert account.owner == "carol"
+        print(f"✓ refresh_token owner preserved: {account.owner}")
+
+    @pytest.mark.asyncio
+    async def test_load_credentials_folder_scan_explicit_owner_overrides_dirname(self, tmp_path):
+        """
+        Test that an explicit owner field overrides the parent-directory derivation
+        during folder scanning.
+
+        What it does: Scans a folder containing a credential file whose entry
+        specifies an explicit "owner".
+        Purpose: Verify explicit owner takes precedence over file_path.parent.name.
+        """
+        print("\n=== Test: folder scan explicit owner overrides dirname ===")
+
+        folder = tmp_path / "accounts"
+        folder.mkdir()
+        cred_file = folder / "data.json"
+        cred_file.write_text(json.dumps({
+            "refreshToken": "token1",
+            "accessToken": "access1",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+        }))
+
+        creds_file = tmp_path / "credentials.json"
+        credentials = [
+            {
+                "type": "json",
+                "path": str(folder),
+                "owner": "custom-owner",
+                "enabled": True,
+            }
+        ]
+        creds_file.write_text(json.dumps(credentials))
+
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json"),
+        )
+
+        await manager.load_credentials()
+
+        assert len(manager._accounts) == 1
+        account = list(manager._accounts.values())[0]
+        assert account.owner == "custom-owner"
+        print(f"✓ Explicit owner used over dirname: {account.owner}")
     
     @pytest.mark.asyncio
     async def test_load_credentials_refresh_token_type(self, tmp_path):

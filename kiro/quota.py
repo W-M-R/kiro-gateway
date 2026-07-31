@@ -66,6 +66,11 @@ _GET_USAGE_LIMITS_PATH = "/GetUsageLimits"
 # Request timeout for quota queries (seconds). Quota API is lightweight.
 _QUOTA_QUERY_TIMEOUT = 30.0
 
+# Sentinel used as "remaining quota" when an account's quota is unknown (never
+# polled, or the last poll failed). Large enough to sort such accounts ahead of
+# any account with real quota figures, since they are not confirmed exhausted.
+QUOTA_UNKNOWN_SENTINEL: int = 10 ** 12
+
 
 def _build_q_host(q_host: str) -> str:
     """
@@ -128,6 +133,22 @@ class QuotaInfo:
     last_updated: float = 0.0
     last_error: Optional[str] = None
 
+    @property
+    def is_quota_unknown(self) -> bool:
+        """
+        Whether the quota figures are untrustworthy because the query failed.
+
+        On a failed GetUsageLimits call, query_quota() returns a QuotaInfo with
+        last_error set and is_exhausted=True. That is NOT a real "out of credits"
+        signal, so callers must not use it to block account selection: the quota
+        endpoint lives on the legacy Q host and can be unreachable while the
+        inference endpoint works fine.
+
+        Returns:
+            True if the last quota query failed (figures are meaningless).
+        """
+        return self.last_error is not None
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a JSON-friendly dictionary for API responses."""
         return {
@@ -147,6 +168,7 @@ class QuotaInfo:
                 if self.next_reset_epoch > 0 else None
             ),
             "is_exhausted": self.is_exhausted,
+            "is_quota_unknown": self.is_quota_unknown,
             "last_updated": self.last_updated,
             "last_error": self.last_error,
         }
