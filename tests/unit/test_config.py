@@ -7,6 +7,7 @@ Verifies loading settings from environment variables.
 
 import pytest
 import os
+import warnings
 from unittest.mock import patch
 
 
@@ -404,22 +405,37 @@ class TestServerPortConfig:
         """
         What it does: Verifies that SERVER_PORT defaults to 8000.
         Purpose: Ensure that 8000 is used when no environment variable is set.
+
+        Note: Deleting os.environ["SERVER_PORT"] is not enough, because reloading
+        config re-runs load_dotenv() which re-populates SERVER_PORT from the local
+        .env file. We patch os.getenv instead (same pattern as the LOG_LEVEL test)
+        so the test is independent of the developer's .env.
         """
-        print("Setup: Removing SERVER_PORT from environment...")
-        
-        with patch.dict(os.environ, {}, clear=False):
-            if "SERVER_PORT" in os.environ:
-                del os.environ["SERVER_PORT"]
-            
+        print("Setup: Mocking os.getenv for SERVER_PORT...")
+
+        original_getenv = os.getenv
+
+        def mock_getenv(key, default=None):
+            if key == "SERVER_PORT":
+                print(f"os.getenv('{key}') -> {default} (mocked)")
+                return default  # Simulate missing variable
+            return original_getenv(key, default)
+
+        with patch.object(os, 'getenv', side_effect=mock_getenv):
             import importlib
             import kiro.config as config_module
             importlib.reload(config_module)
-            
+
             print(f"SERVER_PORT: {config_module.SERVER_PORT}")
             print(f"DEFAULT_SERVER_PORT: {config_module.DEFAULT_SERVER_PORT}")
             print(f"Comparing: Expected 8000, Got {config_module.SERVER_PORT}")
             assert config_module.SERVER_PORT == 8000
             assert config_module.DEFAULT_SERVER_PORT == 8000
+
+        # Restore module with real values
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
     
     def test_server_port_from_environment(self):
         """
@@ -470,48 +486,249 @@ class TestServerPortConfig:
             assert config_module.SERVER_PORT == 8080
 
 
-class TestKiroCliDbFileConfig:
-    """Tests for KIRO_CLI_DB_FILE configuration."""
-    
-    def test_kiro_cli_db_file_config_exists(self):
+class TestKiroCliDbConfig:
+    """Tests for KIRO_CLI_DB configuration (multi-account SQLite paths)."""
+
+    def test_kiro_cli_db_config_exists(self):
         """
-        What it does: Verifies that KIRO_CLI_DB_FILE constant exists.
-        Purpose: Ensure the config parameter is defined.
+        What it does: Verifies that KIRO_CLI_DB constant exists and is a list.
+        Purpose: Ensure the config parameter is defined with the new type.
         """
         print("Setup: Importing config module...")
         import importlib
         import kiro.config as config_module
         importlib.reload(config_module)
-        
-        print("Verification: KIRO_CLI_DB_FILE exists...")
-        assert hasattr(config_module, 'KIRO_CLI_DB_FILE')
-        
-        print(f"KIRO_CLI_DB_FILE: '{config_module.KIRO_CLI_DB_FILE}'")
-        # Default should be empty string
-        assert isinstance(config_module.KIRO_CLI_DB_FILE, str)
-    
-    def test_kiro_cli_db_file_from_environment(self):
+
+        print("Verification: KIRO_CLI_DB exists...")
+        assert hasattr(config_module, 'KIRO_CLI_DB')
+        print(f"KIRO_CLI_DB: {config_module.KIRO_CLI_DB}")
+        assert isinstance(config_module.KIRO_CLI_DB, list)
+
+    def test_kiro_cli_db_default_empty(self):
         """
-        What it does: Verifies loading KIRO_CLI_DB_FILE from environment variable.
-        Purpose: Ensure the value from environment is used and normalized.
+        What it does: Verifies _resolve_kiro_cli_db returns [] when both inputs empty.
+        Purpose: Ensure clean default with no spurious accounts.
         """
-        print("Setup: Importing config module...")
-        import importlib
+        from kiro.config import _resolve_kiro_cli_db
+        result = _resolve_kiro_cli_db("", "")
+        print(f"Resolved: {result}")
+        assert result == []
+
+    def test_parse_single_entry_with_owner(self):
+        """
+        What it does: Parses a single "owner=/path" entry.
+        Purpose: Ensure owner and path are correctly split.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("alice=/data/a.sqlite3")
+        print(f"Parsed: {result}")
+        assert result == [{"owner": "alice", "path": "/data/a.sqlite3"}]
+
+    def test_parse_multiple_entries_with_owners(self):
+        """
+        What it does: Parses multiple comma-separated entries with owners.
+        Purpose: Ensure multi-account parsing works.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("alice=/a/db.sqlite3,bob=/b/db.sqlite3")
+        print(f"Parsed: {result}")
+        assert result == [
+            {"owner": "alice", "path": "/a/db.sqlite3"},
+            {"owner": "bob", "path": "/b/db.sqlite3"},
+        ]
+
+    def test_parse_entry_without_owner(self):
+        """
+        What it does: Parses an entry with no owner prefix.
+        Purpose: Ensure owner defaults to empty string for later derivation.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("/plain/path/db.sqlite3")
+        print(f"Parsed: {result}")
+        assert result == [{"owner": "", "path": "/plain/path/db.sqlite3"}]
+
+    def test_parse_mixed_owners(self):
+        """
+        What it does: Parses a mix of owner-tagged and plain entries.
+        Purpose: Ensure mixed formats coexist.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("alice=/a/db.sqlite3,/b/db.sqlite3")
+        print(f"Parsed: {result}")
+        assert result == [
+            {"owner": "alice", "path": "/a/db.sqlite3"},
+            {"owner": "", "path": "/b/db.sqlite3"},
+        ]
+
+    def test_parse_empty_string(self):
+        """
+        What it does: Parses an empty string.
+        Purpose: Ensure empty input yields an empty list.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        assert _parse_kiro_cli_db("") == []
+
+    def test_parse_whitespace_only_and_trailing_commas(self):
+        """
+        What it does: Parses strings with whitespace and trailing commas.
+        Purpose: Ensure robust trimming and empty-entry skipping.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("  alice = /a/db.sqlite3 , , ,bob=/b/db.sqlite3,  ")
+        print(f"Parsed: {result}")
+        assert result == [
+            {"owner": "alice", "path": "/a/db.sqlite3"},
+            {"owner": "bob", "path": "/b/db.sqlite3"},
+        ]
+
+    def test_parse_owner_with_path_containing_equals(self):
+        """
+        What it does: Parses an entry whose path contains '='.
+        Purpose: Ensure only the first '=' splits owner from path.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("alice=/a/=weird=/path.sqlite3")
+        print(f"Parsed: {result}")
+        assert result == [{"owner": "alice", "path": "/a/=weird=/path.sqlite3"}]
+
+    def test_parse_skips_empty_path(self):
+        """
+        What it does: Parses an entry with owner but empty path.
+        Purpose: Ensure entries with no path are dropped.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db("alice=,bob=/b/db.sqlite3")
+        print(f"Parsed: {result}")
+        assert result == [{"owner": "bob", "path": "/b/db.sqlite3"}]
+
+    def test_parse_windows_path_with_drive_letter(self):
+        """
+        What it does: Parses a Windows-style path containing a colon.
+        Purpose: Ensure '=' separator (not ':') avoids drive-letter conflicts.
+        """
+        from kiro.config import _parse_kiro_cli_db
+        result = _parse_kiro_cli_db(r"alice=C:\Users\alice\data.sqlite3")
+        print(f"Parsed: {result}")
+        assert len(result) == 1
+        assert result[0]["owner"] == "alice"
+        assert result[0]["path"].endswith(r"data.sqlite3")
+
+    def test_legacy_kiro_cli_db_file_backward_compat(self):
+        """
+        What it does: Verifies KIRO_CLI_DB_FILE still works via backward-compat shim.
+        Purpose: Ensure existing single-file deployments are not broken silently.
+        """
+        from kiro.config import _resolve_kiro_cli_db
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            result = _resolve_kiro_cli_db("", "/legacy/path/data.sqlite3")
+        print(f"Resolved: {result}")
+        assert len(result) == 1
+        assert result[0]["path"] == "/legacy/path/data.sqlite3"
+        assert result[0]["owner"] == ""
+
+    def test_legacy_kiro_cli_db_file_emits_deprecation_warning(self):
+        """
+        What it does: Verifies the compat shim emits a DeprecationWarning.
+        Purpose: Make the deprecation visible to users.
+        """
+        from kiro.config import _resolve_kiro_cli_db
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _resolve_kiro_cli_db("", "/legacy/data.sqlite3")
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+        print("✓ DeprecationWarning emitted for KIRO_CLI_DB_FILE")
+
+    def test_kiro_cli_db_takes_precedence_over_legacy(self):
+        """
+        What it does: Verifies KIRO_CLI_DB wins when both vars are set.
+        Purpose: Ensure the new variable is authoritative.
+        """
+        from kiro.config import _resolve_kiro_cli_db
+        result = _resolve_kiro_cli_db("new=/new/data.sqlite3", "/old/data.sqlite3")
+        print(f"Resolved: {result}")
+        assert len(result) == 1
+        assert result[0]["owner"] == "new"
+        assert result[0]["path"] == "/new/data.sqlite3"
+
+
+class TestDeprecatedCredentialsWarning:
+    """
+    Tests for the visible KIRO_CLI_DB_FILE deprecation warning.
+
+    Python's default filters hide DeprecationWarning for non-__main__ modules,
+    so config also prints a warning to stderr at startup. These tests verify the
+    message content for each configuration state.
+    """
+
+    def _render(self, in_use, ignored, legacy="/tmp/legacy/data.sqlite3"):
+        """
+        Invoke _warn_deprecated_credentials_config with patched flags.
+
+        Args:
+            in_use: Value for KIRO_CLI_DB_FILE_IN_USE.
+            ignored: Value for KIRO_CLI_DB_FILE_IGNORED.
+            legacy: Value for the raw legacy path used in the message.
+
+        Returns:
+            Captured stderr output as a string.
+        """
+        import io
+        import contextlib
         import kiro.config as config_module
-        
-        # Test that KIRO_CLI_DB_FILE is loaded and is a string
-        print(f"KIRO_CLI_DB_FILE: {config_module.KIRO_CLI_DB_FILE}")
-        assert isinstance(config_module.KIRO_CLI_DB_FILE, str)
-        
-        # If value is set (not empty), verify it's a normalized path
-        if config_module.KIRO_CLI_DB_FILE:
-            # Path should be normalized (no raw ~ or forward slashes on Windows)
-            assert not config_module.KIRO_CLI_DB_FILE.startswith("~")
-            # Should be a valid path string (contains path separators or is absolute)
-            from pathlib import Path
-            path = Path(config_module.KIRO_CLI_DB_FILE)
-            # Path should be constructable (doesn't raise exception)
-            assert str(path) == config_module.KIRO_CLI_DB_FILE
+
+        with patch.object(config_module, "KIRO_CLI_DB_FILE_IN_USE", in_use), \
+             patch.object(config_module, "KIRO_CLI_DB_FILE_IGNORED", ignored), \
+             patch.object(config_module, "_raw_kiro_cli_db_file", legacy):
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                config_module._warn_deprecated_credentials_config()
+            return buf.getvalue()
+
+    def test_warning_silent_when_only_new_variable_used(self):
+        """
+        What it does: Verifies no output when KIRO_CLI_DB_FILE is unused.
+        Purpose: Avoid nagging users who already migrated.
+        """
+        out = self._render(in_use=False, ignored=False)
+        print(f"Output: {out!r}")
+        assert out == ""
+
+    def test_warning_shows_migration_hint_when_legacy_in_use(self):
+        """
+        What it does: Verifies the migration hint when only the legacy var is set.
+        Purpose: Users must be told how to migrate, including the owner= syntax.
+        """
+        out = self._render(in_use=True, ignored=False)
+        print(f"Output: {out}")
+        assert "deprecated" in out
+        assert "KIRO_CLI_DB" in out
+        # Must echo the user's actual path so the hint is copy-pasteable
+        assert "/tmp/legacy/data.sqlite3" in out
+        # Must document the optional owner label
+        assert "owner=" in out
+
+    def test_warning_says_ignored_when_both_variables_set(self):
+        """
+        What it does: Verifies the message when both variables are set.
+        Purpose: Explain that the legacy var is inert, preventing confusion when
+        edits to KIRO_CLI_DB_FILE appear to have no effect.
+        """
+        out = self._render(in_use=False, ignored=True)
+        print(f"Output: {out}")
+        assert "IGNORED" in out
+        assert "Remove KIRO_CLI_DB_FILE" in out
+
+    def test_deprecation_flags_are_mutually_exclusive(self):
+        """
+        What it does: Verifies IN_USE and IGNORED are never both true.
+        Purpose: The two states are contradictory; both true would mean the compat
+        logic double-counted the legacy variable.
+        """
+        import kiro.config as config_module
+        assert not (config_module.KIRO_CLI_DB_FILE_IN_USE
+                    and config_module.KIRO_CLI_DB_FILE_IGNORED)
 
 
 class TestFallbackModelsConfig:

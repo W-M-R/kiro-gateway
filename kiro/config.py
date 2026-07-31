@@ -52,6 +52,52 @@ def _parse_str_list(raw: str, sep: str = ",") -> List[str]:
         return []
     return [item.strip() for item in raw.split(sep) if item.strip()]
 
+
+def _parse_kiro_cli_db(raw: str) -> List[Dict[str, str]]:
+    """
+    Parse the KIRO_CLI_DB env var into a list of kiro-cli SQLite account descriptors.
+
+    Format: ``"owner1=/path1/data.sqlite3,owner2=/path2/data.sqlite3,/path3"``
+    - Comma-separated entries.
+    - Each entry: optional ``owner=`` prefix, then a file path.
+    - If owner is omitted, it is derived from the path's parent directory name
+      at load time (AccountManager._try_add_credential_file / load_credentials).
+    - Paths are normalized via ``Path`` but ``~`` is NOT expanded here; expansion
+      happens at validation/use time, matching the legacy KIRO_CLI_DB_FILE behavior.
+
+    Args:
+        raw: Raw environment variable string.
+
+    Returns:
+        List of dicts, each with keys ``owner`` (str, possibly empty) and
+        ``path`` (str). Empty list if raw is empty.
+
+    Examples:
+        >>> _parse_kiro_cli_db("alice=/a/db.sqlite3,/b/db.sqlite3")
+        [{'owner': 'alice', 'path': '/a/db.sqlite3'}, {'owner': '', 'path': '/b/db.sqlite3'}]
+        >>> _parse_kiro_cli_db("")
+        []
+    """
+    if not raw:
+        return []
+    result: List[Dict[str, str]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" in item:
+            owner, path = item.split("=", 1)
+            owner = owner.strip()
+            path = path.strip()
+        else:
+            owner = ""
+            path = item
+        if not path:
+            continue
+        result.append({"owner": owner, "path": str(Path(path))})
+    return result
+
+
 # Load environment variables
 load_dotenv()
 
@@ -64,35 +110,73 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     (e.g., D:\\Projects\\file.json) may be incorrectly interpreted
     as escape sequences (\\a -> bell, \\n -> newline, etc.).
     
+    Supports multi-line values wrapped in matching quotes (single or double),
+    which is standard .env syntax for long values that span multiple lines.
+    
     Args:
         var_name: Environment variable name
         env_file: Path to .env file (default ".env")
     
     Returns:
         Raw variable value or None if not found
+    
+    Examples:
+        Single-line:  VAR="value"  -> 'value'
+        Multi-line:   VAR="line1,
+                                  line2"       -> 'line1,\nline2'
+        Unquoted:     VAR=value     -> 'value'
     """
     env_path = Path(env_file)
     if not env_path.exists():
         return None
     
+    prefix = f"{var_name}="
+    
     try:
-        # Read file as-is, without interpretation
-        content = env_path.read_text(encoding="utf-8")
+        lines = env_path.read_text(encoding="utf-8").splitlines()
         
-        # Search for variable considering different formats:
-        # VAR="value" or VAR='value' or VAR=value
-        # Pattern captures value with or without quotes
-        pattern = rf'^{re.escape(var_name)}=(["\']?)(.+?)\1\s*$'
-        
-        for line in content.splitlines():
-            line = line.strip()
-            if line.startswith("#") or not line:
+        for index, raw_line in enumerate(lines):
+            stripped = raw_line.strip()
+            
+            # Skip blank lines and full-line comments
+            if not stripped or stripped.startswith("#"):
                 continue
             
-            match = re.match(pattern, line)
-            if match:
-                # Return value as-is, without processing escape sequences
-                return match.group(2)
+            if not stripped.startswith(prefix):
+                continue
+            
+            value = stripped[len(prefix):]
+            
+            # Bare "VAR=" with nothing after it
+            if not value:
+                return ""
+            
+            quote = value[0] if value[0] in ("\"", "'") else None
+            
+            # Unquoted value: return as-is (no escape processing)
+            if quote is None:
+                return value
+            
+            # Quoted value: look for the closing quote on this same line.
+            # This correctly handles empty values ("") and trailing inline
+            # comments (VAR="a" # note) without crossing line boundaries.
+            remainder = value[1:]
+            closing = remainder.find(quote)
+            if closing != -1:
+                return remainder[:closing]
+            
+            # Quote is unterminated on this line, so the value spans multiple
+            # lines. Accumulate following lines until the closing quote.
+            collected = [remainder]
+            for follow in lines[index + 1:]:
+                closing = follow.find(quote)
+                if closing != -1:
+                    collected.append(follow[:closing])
+                    return "\n".join(collected)
+                collected.append(follow)
+            
+            # Never closed (malformed .env): return what we had on the first line
+            return remainder
     except Exception:
         pass
     
@@ -202,11 +286,97 @@ _raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS
 # Normalize path for cross-platform compatibility
 KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
 
-# Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
-# Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
-# or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
-_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
-KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
+# kiro-cli SQLite databases (optional, for AWS SSO OIDC authentication).
+# Specify one or more kiro-cli data.sqlite3 files with optional owner labels.
+# Format: "owner1=/path1/data.sqlite3,owner2=/path2/data.sqlite3,/path3"
+# - owner is optional; when omitted it is derived from the parent directory name.
+# - Default single-account location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
+#   or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
+
+
+def _resolve_kiro_cli_db(raw_db: str, raw_legacy_file: str) -> List[Dict[str, str]]:
+    """
+    Resolve KIRO_CLI_DB accounts, with backward-compat for KIRO_CLI_DB_FILE.
+
+    If ``raw_db`` (KIRO_CLI_DB) yields one or more entries, they are used as-is.
+    Otherwise, if ``raw_legacy_file`` (the deprecated KIRO_CLI_DB_FILE) is set,
+    it is converted to a single entry with an empty owner (derived at load time)
+    and a DeprecationWarning is emitted.
+
+    Args:
+        raw_db: Raw KIRO_CLI_DB env var value (may be empty).
+        raw_legacy_file: Raw KIRO_CLI_DB_FILE env var value (may be empty).
+
+    Returns:
+        List of account descriptors (each with ``owner`` and ``path`` keys).
+    """
+    result = _parse_kiro_cli_db(raw_db)
+    if result:
+        return result
+    if raw_legacy_file:
+        import warnings as _warnings
+        _warnings.warn(
+            "KIRO_CLI_DB_FILE is deprecated and will be removed in a future release. "
+            "Migrate to KIRO_CLI_DB (e.g. KIRO_CLI_DB=\"owner=/path/data.sqlite3\").",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return [{"owner": "", "path": str(Path(raw_legacy_file))}]
+    return []
+
+
+_raw_kiro_cli_db = _get_raw_env_value("KIRO_CLI_DB") or os.getenv("KIRO_CLI_DB", "")
+_raw_kiro_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
+
+KIRO_CLI_DB: List[Dict[str, str]] = _resolve_kiro_cli_db(_raw_kiro_cli_db, _raw_kiro_cli_db_file)
+
+# True when accounts came from the deprecated KIRO_CLI_DB_FILE (compat fallback).
+KIRO_CLI_DB_FILE_IN_USE: bool = bool(_raw_kiro_cli_db_file) and not _parse_kiro_cli_db(_raw_kiro_cli_db)
+
+# True when KIRO_CLI_DB_FILE is set but ignored because KIRO_CLI_DB takes precedence.
+KIRO_CLI_DB_FILE_IGNORED: bool = bool(_raw_kiro_cli_db_file) and bool(_parse_kiro_cli_db(_raw_kiro_cli_db))
+
+
+def _warn_deprecated_credentials_config() -> None:
+    """
+    Print a visible warning when the deprecated KIRO_CLI_DB_FILE is used.
+
+    Called at application startup.
+
+    A DeprecationWarning is also raised in _resolve_kiro_cli_db(), but Python's
+    default warning filters hide DeprecationWarning for non-__main__ modules, so
+    users would never see it. This prints to stderr instead, matching the
+    behavior of _warn_timeout_configuration().
+    """
+    if not (KIRO_CLI_DB_FILE_IN_USE or KIRO_CLI_DB_FILE_IGNORED):
+        return
+
+    import sys
+    YELLOW = "\033[93m"
+    RESET = "\033[0m"
+
+    if KIRO_CLI_DB_FILE_IGNORED:
+        detail = (
+            "    KIRO_CLI_DB_FILE is set but IGNORED because KIRO_CLI_DB is also set.\n"
+            "    Remove KIRO_CLI_DB_FILE from your .env to silence this warning."
+        )
+    else:
+        example = _raw_kiro_cli_db_file or "/path/data.sqlite3"
+        detail = (
+            "    KIRO_CLI_DB_FILE is deprecated and will be removed in a future release.\n"
+            "\n"
+            "    Migrate to KIRO_CLI_DB, which supports multiple accounts:\n"
+            f"      KIRO_CLI_DB=\"{example}\"\n"
+            "\n"
+            "    Optionally label each account with owner= (used by ACCOUNT_PRIORITY\n"
+            "    and the status dashboard):\n"
+            f"      KIRO_CLI_DB=\"alice={example},bob=/path/to/bob/data.sqlite3\""
+        )
+
+    print(
+        f"\n{YELLOW}⚠️  WARNING: Deprecated credential configuration detected.\n\n{detail}{RESET}\n",
+        file=sys.stderr,
+    )
 
 # Disable SQLite write-back (read-only mode)
 # When enabled, gateway will only read from kiro-cli database without modifying it.

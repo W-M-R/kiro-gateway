@@ -53,7 +53,7 @@ AWS_SSO_OIDC_TOKEN_URL = None  # Will be set when SSO_REGION is known
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
 PROFILE_ARN = os.getenv("PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK")
 KIRO_CREDS_FILE = os.getenv("KIRO_CREDS_FILE", "")
-KIRO_CLI_DB_FILE = os.getenv("KIRO_CLI_DB_FILE", "")
+KIRO_CLI_DB = os.getenv("KIRO_CLI_DB", "")
 
 # AWS SSO OIDC specific credentials
 CLIENT_ID = None
@@ -194,16 +194,19 @@ def load_credentials_from_sqlite(db_path: str) -> bool:
 # --- Load credentials (priority: SQLite > JSON > env) ---
 cred_source = "REFRESH_TOKEN"
 
-if KIRO_CLI_DB_FILE:
-    if load_credentials_from_sqlite(KIRO_CLI_DB_FILE):
-        cred_source = "KIRO_CLI_DB_FILE (SQLite)"
+if KIRO_CLI_DB:
+    # KIRO_CLI_DB may contain multiple "owner=/path" entries; use the first one.
+    first_entry = KIRO_CLI_DB.split(",")[0].strip()
+    cli_db_path = first_entry.split("=", 1)[1].strip() if "=" in first_entry else first_entry
+    if load_credentials_from_sqlite(cli_db_path):
+        cred_source = f"KIRO_CLI_DB (SQLite): {cli_db_path}"
 elif KIRO_CREDS_FILE:
     if load_credentials_from_json(KIRO_CREDS_FILE):
         cred_source = "KIRO_CREDS_FILE (JSON)"
 
 # --- Validate required credentials ---
 if not REFRESH_TOKEN:
-    logger.error("No credentials configured. Set REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB_FILE. Exiting.")
+    logger.error("No credentials configured. Set REFRESH_TOKEN, KIRO_CREDS_FILE, or KIRO_CLI_DB. Exiting.")
     sys.exit(1)
 
 # Additional validation for AWS SSO OIDC

@@ -47,7 +47,7 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.PROFILE_ARN", "arn:aws:codewhisperer:us-east-1:123456789:profile/test")
         monkeypatch.setattr("main.REGION", "us-east-1")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -104,7 +104,7 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -187,7 +187,7 @@ class TestLifespanLegacyFallback:
         # Patch constants directly
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", str(sqlite_db))
+        monkeypatch.setattr("main.KIRO_CLI_DB", [{"owner": "", "path": str(sqlite_db)}])
         monkeypatch.setattr("main.KIRO_CREDS_FILE", str(json_file))
         
         creds_file = tmp_path / "credentials.json"
@@ -236,7 +236,7 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         # Patch os.getenv for the helper function
         monkeypatch.setenv("PROFILE_ARN", "arn:aws:codewhisperer:eu-central-1:123456789:profile/test")
@@ -274,6 +274,119 @@ class TestLifespanLegacyFallback:
         assert creds[0]["region"] == "eu-west-1"
         assert creds[0]["api_region"] == "eu-central-1"
         print("✓ Env overrides were added to credentials.json")
+
+    @pytest.mark.asyncio
+    async def test_lifespan_migration_multi_account_kiro_cli_db(self, tmp_path, monkeypatch):
+        """
+        Test: Multi-account migration from KIRO_CLI_DB.
+
+        What it does: Verifies that multiple KIRO_CLI_DB entries produce multiple
+        credentials.json entries with owner labels preserved.
+        Purpose: Ensure multi-account load balancing can be configured via .env.
+        """
+        print("\n=== Test: Multi-account KIRO_CLI_DB migration ===")
+
+        import sqlite3
+        db_a = tmp_path / "a.sqlite3"
+        db_b = tmp_path / "b.sqlite3"
+        for db in (db_a, db_b):
+            conn = sqlite3.connect(str(db))
+            conn.cursor().execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+            conn.commit()
+            conn.close()
+
+        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
+        monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
+        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr(
+            "main.KIRO_CLI_DB",
+            [
+                {"owner": "alice", "path": str(db_a)},
+                {"owner": "bob", "path": str(db_b)},
+            ],
+        )
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
+        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+
+        mock_manager = AsyncMock()
+        mock_manager._accounts = {"test": MagicMock()}
+        mock_manager._current_account_index = 0
+        mock_manager._initialize_account = AsyncMock(return_value=True)
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
+
+        with patch("main.AccountManager", return_value=mock_manager):
+            with patch("main.httpx.AsyncClient") as mock_client_class:
+                mock_client = AsyncMock()
+                mock_client_class.return_value = mock_client
+
+                from main import lifespan, app
+                async with lifespan(app):
+                    pass
+
+        creds = json.loads(creds_file.read_text())
+        print(f"Created credentials: {creds}")
+
+        assert len(creds) == 2
+        assert creds[0] == {"type": "sqlite", "path": str(db_a), "owner": "alice"}
+        assert creds[1] == {"type": "sqlite", "path": str(db_b), "owner": "bob"}
+        print("✓ Multiple KIRO_CLI_DB entries migrated with owners")
+
+    @pytest.mark.asyncio
+    async def test_lifespan_migration_kiro_cli_db_without_owner(self, tmp_path, monkeypatch):
+        """
+        Test: KIRO_CLI_DB entry without owner omits the owner key.
+
+        What it does: Verifies that an entry with empty owner does not write an
+        "owner" field to credentials.json (owner is derived at load time).
+        Purpose: Ensure clean credentials.json when owner is not specified.
+        """
+        print("\n=== Test: KIRO_CLI_DB without owner ===")
+
+        import sqlite3
+        db = tmp_path / "data.sqlite3"
+        conn = sqlite3.connect(str(db))
+        conn.cursor().execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
+        monkeypatch.setattr("main.REFRESH_TOKEN", "")
+        monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [{"owner": "", "path": str(db)}])
+
+        creds_file = tmp_path / "credentials.json"
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("main.ACCOUNTS_CONFIG_FILE", str(creds_file))
+        monkeypatch.setattr("main.ACCOUNTS_STATE_FILE", str(state_file))
+
+        mock_manager = AsyncMock()
+        mock_manager._accounts = {"test": MagicMock()}
+        mock_manager._current_account_index = 0
+        mock_manager._initialize_account = AsyncMock(return_value=True)
+        mock_manager._save_state = AsyncMock()
+        mock_manager.save_state_periodically = AsyncMock()
+
+        with patch("main.AccountManager", return_value=mock_manager):
+            with patch("main.httpx.AsyncClient") as mock_client_class:
+                mock_client = AsyncMock()
+                mock_client_class.return_value = mock_client
+
+                from main import lifespan, app
+                async with lifespan(app):
+                    pass
+
+        creds = json.loads(creds_file.read_text())
+        print(f"Created credentials: {creds}")
+
+        assert len(creds) == 1
+        assert creds[0]["type"] == "sqlite"
+        assert creds[0]["path"] == str(db)
+        assert "owner" not in creds[0]
+        print("✓ Entry without owner omits owner key")
     
     @pytest.mark.asyncio
     async def test_lifespan_skip_migration_if_exists(self, tmp_path, monkeypatch):
@@ -289,7 +402,7 @@ class TestLifespanLegacyFallback:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_refresh_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -353,7 +466,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -419,7 +532,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -475,7 +588,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -517,7 +630,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -572,7 +685,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -630,7 +743,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -670,7 +783,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -714,7 +827,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -765,7 +878,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -815,7 +928,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"
@@ -873,7 +986,7 @@ class TestLifespanAccountManagerInit:
         monkeypatch.setattr("main.ACCOUNT_SYSTEM", True)
         monkeypatch.setattr("main.REFRESH_TOKEN", "test_token")
         monkeypatch.setattr("main.KIRO_CREDS_FILE", None)
-        monkeypatch.setattr("main.KIRO_CLI_DB_FILE", None)
+        monkeypatch.setattr("main.KIRO_CLI_DB", [])
         
         creds_file = tmp_path / "credentials.json"
         state_file = tmp_path / "state.json"

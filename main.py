@@ -63,7 +63,7 @@ from kiro.config import (
     PROFILE_ARN,
     REGION,
     KIRO_CREDS_FILE,
-    KIRO_CLI_DB_FILE,
+    KIRO_CLI_DB,
     PROXY_API_KEY,
     LOG_LEVEL,
     SERVER_HOST,
@@ -81,6 +81,7 @@ from kiro.config import (
     ACCOUNTS_STATE_FILE,
     STATUS_SERVER_PORT,
     _warn_timeout_configuration,
+    _warn_deprecated_credentials_config,
     get_httpx_verify_config,
 )
 from kiro.auth import KiroAuthManager
@@ -216,7 +217,7 @@ def validate_configuration() -> None:
     
     Priority:
     1. credentials.json (Account System) - if exists, skip legacy validation
-    2. Legacy .env variables (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB_FILE)
+    2. Legacy .env variables (REFRESH_TOKEN, KIRO_CREDS_FILE, KIRO_CLI_DB)
     
     Checks:
     - Either credentials.json exists OR legacy variables are configured
@@ -243,7 +244,7 @@ def validate_configuration() -> None:
     # Check for credentials (from .env or environment variables)
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE)
-    has_cli_db = bool(KIRO_CLI_DB_FILE)
+    has_cli_db = bool(KIRO_CLI_DB)
     
     # Check if creds file actually exists
     if KIRO_CREDS_FILE:
@@ -252,12 +253,16 @@ def validate_configuration() -> None:
             has_creds_file = False
             logger.warning(f"KIRO_CREDS_FILE not found: {KIRO_CREDS_FILE}")
     
-    # Check if CLI database file actually exists
-    if KIRO_CLI_DB_FILE:
-        cli_db_path = Path(KIRO_CLI_DB_FILE).expanduser()
-        if not cli_db_path.exists():
-            has_cli_db = False
-            logger.warning(f"KIRO_CLI_DB_FILE not found: {KIRO_CLI_DB_FILE}")
+    # Check if each kiro-cli SQLite database file actually exists
+    if KIRO_CLI_DB:
+        valid_entries = []
+        for db_entry in KIRO_CLI_DB:
+            db_path = Path(db_entry["path"]).expanduser()
+            if not db_path.exists():
+                logger.warning(f"KIRO_CLI_DB path not found: {db_entry['path']}")
+            else:
+                valid_entries.append(db_entry)
+        has_cli_db = bool(valid_entries)
     
     # If no credentials found, show helpful error
     if not has_refresh_token and not has_creds_file and not has_cli_db:
@@ -275,7 +280,8 @@ def validate_configuration() -> None:
                 "   2.2. Set your Kiro credentials:\n"
                 "      - Option 1: KIRO_CREDS_FILE to your Kiro credentials JSON file\n"
                 "      - Option 2: REFRESH_TOKEN from Kiro IDE traffic\n"
-                "      - Option 3: KIRO_CLI_DB_FILE to kiro-cli SQLite database\n"
+                "      - Option 3: KIRO_CLI_DB to one or more kiro-cli SQLite databases\n"
+                "        (e.g. KIRO_CLI_DB=\"owner=/path/data.sqlite3\")\n"
                 "\n"
                 "Or use environment variables (for Docker):\n"
                 "   docker run -e PROXY_API_KEY=\"...\" -e REFRESH_TOKEN=\"...\" ...\n"
@@ -299,7 +305,8 @@ def validate_configuration() -> None:
                 "      REFRESH_TOKEN=\"your_refresh_token_here\"\n"
                 "\n"
                 "   Option 3: kiro-cli SQLite database (AWS SSO)\n"
-                "      KIRO_CLI_DB_FILE=\"~/.local/share/kiro-cli/data.sqlite3\"\n"
+                "      KIRO_CLI_DB=\"owner=/path/data.sqlite3\"\n"
+                "      (single: KIRO_CLI_DB=\"/path/data.sqlite3\")\n"
                 "\n"
                 "   See README.md for how to obtain credentials."
             )
@@ -368,7 +375,9 @@ async def lifespan(app: FastAPI):
     # Check if we have legacy .env credentials
     has_refresh_token = bool(REFRESH_TOKEN)
     has_creds_file = bool(KIRO_CREDS_FILE) and Path(KIRO_CREDS_FILE).expanduser().exists()
-    has_cli_db = bool(KIRO_CLI_DB_FILE) and Path(KIRO_CLI_DB_FILE).expanduser().exists()
+    has_cli_db = bool(KIRO_CLI_DB) and all(
+        Path(e["path"]).expanduser().exists() for e in KIRO_CLI_DB
+    )
     
     # Helper function to add optional per-account overrides from .env
     def _add_env_overrides(entry: dict) -> None:
@@ -392,14 +401,17 @@ async def lifespan(app: FastAPI):
                 logger.info("credentials.json not found, creating from .env (one-time migration)")
                 credentials = []
                 
-                # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
+                # Priority: SQLite DB (one entry per KIRO_CLI_DB item) > JSON file > refresh token
                 if has_cli_db:
-                    entry = {
-                        "type": "sqlite",
-                        "path": KIRO_CLI_DB_FILE
-                    }
-                    _add_env_overrides(entry)
-                    credentials.append(entry)
+                    for db_entry in KIRO_CLI_DB:
+                        entry = {
+                            "type": "sqlite",
+                            "path": db_entry["path"]
+                        }
+                        if db_entry["owner"]:
+                            entry["owner"] = db_entry["owner"]
+                        _add_env_overrides(entry)
+                        credentials.append(entry)
                 elif has_creds_file:
                     entry = {
                         "type": "json",
@@ -426,14 +438,17 @@ async def lifespan(app: FastAPI):
             logger.debug("Legacy mode: recreating credentials.json from .env")
             credentials = []
             
-            # Priority: SQLite DB > JSON file > environment variables (same as KiroAuthManager)
+            # Priority: SQLite DB (one entry per KIRO_CLI_DB item) > JSON file > refresh token
             if has_cli_db:
-                entry = {
-                    "type": "sqlite",
-                    "path": KIRO_CLI_DB_FILE
-                }
-                _add_env_overrides(entry)
-                credentials.append(entry)
+                for db_entry in KIRO_CLI_DB:
+                    entry = {
+                        "type": "sqlite",
+                        "path": db_entry["path"]
+                    }
+                    if db_entry["owner"]:
+                        entry["owner"] = db_entry["owner"]
+                    _add_env_overrides(entry)
+                    credentials.append(entry)
             elif has_creds_file:
                 entry = {
                     "type": "json",
@@ -797,6 +812,9 @@ if __name__ == "__main__":
     
     # Warn about suboptimal timeout configuration
     _warn_timeout_configuration()
+    
+    # Warn about deprecated credential configuration (KIRO_CLI_DB_FILE)
+    _warn_deprecated_credentials_config()
     
     # Resolve final configuration with priority hierarchy
     final_host, final_port, final_status_port = resolve_server_config(args)
