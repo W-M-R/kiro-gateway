@@ -134,24 +134,28 @@ class TestAccountSystemFullFlow:
         )
         print(f"Account 1 failed: failures={manager._accounts[account1_id].failures}")
         
-        # 2. Get next account (should return account2)
-        # Mock random.random() to disable probabilistic retry (make test deterministic)
+        # Mock random.random() to disable probabilistic retry for ALL selections
+        # below. account1 stays in backoff for the rest of this test, so every
+        # get_next_account() call hits the Circuit Breaker's probabilistic retry
+        # branch. Leaving any call outside this patch makes the test flaky
+        # (~10% failure rate, matching ACCOUNT_PROBABILISTIC_RETRY_CHANCE=0.1).
         with patch('random.random', return_value=0.5):  # > 0.1 = no probabilistic retry
+            # 2. Get next account (should return account2)
             next_account = await manager.get_next_account("claude-opus-4.5")
-        account2_id = list(manager._accounts.keys())[1]
-        
-        print(f"Next account: {next_account.id if next_account else None}")
-        assert next_account is not None
-        assert next_account.id == account2_id
-        
-        # 3. Second account succeeds
-        await manager.report_success(account2_id, "claude-opus-4.5")
-        print(f"Account 2 succeeded: failures={manager._accounts[account2_id].failures}")
-        
-        # 4. Verify sticky behavior - should prefer account2 now
-        next_account_again = await manager.get_next_account("claude-opus-4.5")
-        print(f"Next account (sticky): {next_account_again.id if next_account_again else None}")
-        assert next_account_again.id == account2_id
+            account2_id = list(manager._accounts.keys())[1]
+
+            print(f"Next account: {next_account.id if next_account else None}")
+            assert next_account is not None
+            assert next_account.id == account2_id
+
+            # 3. Second account succeeds
+            await manager.report_success(account2_id, "claude-opus-4.5")
+            print(f"Account 2 succeeded: failures={manager._accounts[account2_id].failures}")
+
+            # 4. Verify sticky behavior - should prefer account2 now
+            next_account_again = await manager.get_next_account("claude-opus-4.5")
+            print(f"Next account (sticky): {next_account_again.id if next_account_again else None}")
+            assert next_account_again.id == account2_id
         
         print("✓ Full failover flow completed successfully")
     
