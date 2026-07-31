@@ -57,6 +57,7 @@ from kiro.streaming_core import (
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
     from kiro.cache import ModelInfoCache
+    from kiro.mcp_tools import WebSearchContinuation
 
 # Import debug_logger for logging
 try:
@@ -78,7 +79,8 @@ async def stream_kiro_to_openai_internal(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator for converting Kiro stream to OpenAI format.
@@ -127,9 +129,20 @@ async def stream_kiro_to_openai_internal(
     tool_calls_from_stream = []
     
     try:
-        # Use streaming_core.parse_kiro_stream for unified event parsing
-        # This handles AWS SSE parsing, first token timeout, and thinking parser
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        # Select the event source. When a web_search continuation context is
+        # provided, route through web_search_event_source so web_search tool
+        # calls are executed and fed back to the model (tool round-trip). When
+        # absent (web_search disabled), use parse_kiro_stream directly to keep
+        # behaviour identical to the non-web_search path.
+        if web_search_continuation is not None:
+            from kiro.mcp_tools import web_search_event_source
+            event_source = web_search_event_source(
+                response, web_search_continuation, auth_manager, first_token_timeout
+            )
+        else:
+            event_source = parse_kiro_stream(response, first_token_timeout)
+
+        async for event in event_source:
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
@@ -184,82 +197,20 @@ async def stream_kiro_to_openai_internal(
                 
                 yield chunk_text
             
+            elif event.type == "web_search":
+                # WebSearch was executed by web_search_event_source and results are
+                # fed back to the model (continuation flow). The OpenAI wire format
+                # has no native server-side tool transparency blocks, so there is
+                # nothing to emit here — the model's follow-up text (or the raw
+                # summary fallback) arrives as normal "content" events. This branch
+                # exists to prevent the synthetic web_search event from being
+                # misclassified as a regular tool call.
+                logger.debug("web_search transparency event (no OpenAI wire representation, skipping)")
+                continue
+
             elif event.type == "tool_use" and event.tool_use:
-                tool = event.tool_use
-                
-                # Extract tool name safely (handle None/missing fields)
-                tool_name = ""
-                if tool:
-                    tool_name = (tool.get("function") or {}).get("name", "") or tool.get("name", "")
-                
-                # ==============================================================================
-                # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
-                # ==============================================================================
-                
-                # INTERCEPT web_search tool calls (Path B - MCP emulation)
-                if tool_name == "web_search":
-                    from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
-                    
-                    logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
-                    
-                    # Parse tool_input
-                    tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
-                    if isinstance(tool_input, str):
-                        try:
-                            tool_input = json.loads(tool_input)
-                        except json.JSONDecodeError:
-                            tool_input = {}
-                    
-                    # Extract query
-                    query = tool_input.get("query", "")
-                    if not query:
-                        logger.warning("web_search called without query, skipping MCP call")
-                        # Continue with normal tool_use processing
-                    else:
-                        logger.debug(f"WebSearch query (Path B): {query}")
-                        
-                        # Call MCP API
-                        mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-                        
-                        if results is None:
-                            logger.error("MCP API call failed for web_search")
-                            # Continue with normal tool_use processing (will show error to user)
-                        else:
-                            # Emit summary as content chunks (OpenAI format)
-                            summary = generate_search_summary(query, results)
-                            
-                            # Send content chunks
-                            chunk_size = 100
-                            for i in range(0, len(summary), chunk_size):
-                                content_chunk = summary[i:i + chunk_size]
-                                
-                                delta = {"content": content_chunk}
-                                if first_chunk:
-                                    delta["role"] = "assistant"
-                                    first_chunk = False
-                                
-                                openai_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-                                }
-                                
-                                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                                
-                                if debug_logger:
-                                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
-                                
-                                yield chunk_text
-                            
-                            # Accumulate for token counting
-                            full_content += summary
-                            
-                            # Skip normal tool_use processing
-                            continue
-                
-                # Collect tool calls from stream (normal tools, not web_search)
+                # Collect tool calls from stream (web_search is handled upstream by
+                # web_search_event_source and never reaches here as a tool_use).
                 tool_calls_from_stream.append(event.tool_use)
             
             elif event.type == "usage" and event.usage:
@@ -454,7 +405,8 @@ async def stream_kiro_to_openai(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to OpenAI format.
@@ -470,6 +422,8 @@ async def stream_kiro_to_openai(
         auth_manager: Authentication manager
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        web_search_continuation: Optional continuation context enabling the
+            web_search tool round-trip (see stream_kiro_to_openai_internal).
     
     Yields:
         Strings in SSE format: "data: {...}\\n\\n" or "data: [DONE]\\n\\n"
@@ -477,7 +431,8 @@ async def stream_kiro_to_openai(
     async for chunk in stream_kiro_to_openai_internal(
         client, response, model, model_cache, auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        web_search_continuation=web_search_continuation
     ):
         yield chunk
 
@@ -492,7 +447,8 @@ async def stream_with_first_token_retry(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout.
@@ -557,7 +513,8 @@ async def stream_with_first_token_retry(
             auth_manager,
             first_token_timeout=first_token_timeout,
             request_messages=request_messages,
-            request_tools=request_tools
+            request_tools=request_tools,
+            web_search_continuation=web_search_continuation
         ):
             yield chunk
     
@@ -580,7 +537,8 @@ async def collect_stream_response(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> dict:
     """
     Collect full response from streaming stream.
@@ -596,6 +554,8 @@ async def collect_stream_response(
         auth_manager: Authentication manager
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        web_search_continuation: Optional continuation context enabling the
+            web_search tool round-trip (see stream_kiro_to_openai_internal).
     
     Returns:
         Dictionary with full response in OpenAI chat.completion format
@@ -614,7 +574,8 @@ async def collect_stream_response(
         model_cache,
         auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        web_search_continuation=web_search_continuation
     ):
         if not chunk_str.startswith("data:"):
             continue

@@ -567,6 +567,28 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 # Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
 WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
 
+# Maximum number of consecutive web_search continuation rounds within a single
+# client request (default: 5).
+#
+# When the model calls web_search, the gateway executes the search via the MCP
+# API and then sends the results back to the model in a follow-up Kiro request
+# so the model can produce a final answer (tool-use round-trip). The model may
+# decide to search again based on the results, which starts another round. This
+# limit prevents runaway loops where the model keeps searching indefinitely.
+#
+# Once the limit is reached, the raw search summary is emitted directly to the
+# client (legacy behaviour) instead of triggering another continuation, so the
+# user still receives the last search results.
+#
+# Set to 1 to disable continuation entirely (emit raw results, never ask the
+# model to consume them). Values below 1 are clamped to 1.
+try:
+    WEB_SEARCH_MAX_ITERATIONS: int = int(os.getenv("WEB_SEARCH_MAX_ITERATIONS", "5"))
+except ValueError:
+    WEB_SEARCH_MAX_ITERATIONS = 5
+if WEB_SEARCH_MAX_ITERATIONS < 1:
+    WEB_SEARCH_MAX_ITERATIONS = 1
+
 # ==================================================================================================
 # Account System Settings
 # ==================================================================================================

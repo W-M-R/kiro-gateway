@@ -24,8 +24,104 @@ from kiro.mcp_tools import (
     extract_query_from_messages,
     handle_native_web_search,
     generate_anthropic_web_search_sse,
-    generate_openai_web_search_sse
+    generate_openai_web_search_sse,
+    build_web_search_continuation_payload,
+    web_search_event_source,
+    WebSearchContinuation,
+    _extract_web_search_query,
 )
+from kiro.streaming_core import KiroEvent
+
+
+def _make_base_payload(with_history=False, with_tools=True):
+    """
+    Build a minimal Kiro payload for continuation tests.
+
+    Args:
+        with_history: Include a pre-existing history entry.
+        with_tools: Include a tools definition in the current message context.
+
+    Returns:
+        A Kiro payload dict shaped like build_kiro_payload output.
+    """
+    context = {}
+    if with_tools:
+        context["tools"] = [{
+            "toolSpecification": {
+                "name": "web_search",
+                "description": "Search the web",
+                "inputSchema": {"json": {"type": "object"}}
+            }
+        }]
+    current = {
+        "userInputMessage": {
+            "content": "What is the weather in Paris?",
+            "modelId": "claude-sonnet-4.5",
+            "origin": "AI_EDITOR",
+        }
+    }
+    if context:
+        current["userInputMessage"]["userInputMessageContext"] = context
+
+    state = {
+        "chatTriggerType": "MANUAL",
+        "conversationId": "conv-123",
+        "currentMessage": current,
+    }
+    if with_history:
+        state["history"] = [{
+            "userInputMessage": {"content": "hi", "modelId": "claude-sonnet-4.5"}
+        }, {
+            "assistantResponseMessage": {"content": "hello"}
+        }]
+
+    return {"conversationState": state, "profileArn": "arn:test"}
+
+
+def _make_results(n=2):
+    """Build a fake MCP web_search results dict with n entries."""
+    return {
+        "results": [
+            {
+                "title": f"Result {i}",
+                "url": f"https://example.com/{i}",
+                "snippet": f"Snippet {i}",
+                "publishedDate": 1700000000000,
+            }
+            for i in range(n)
+        ],
+        "totalResults": n,
+        "query": "test",
+    }
+
+
+def _make_ws_tool(query="paris weather", as_string=False, anthropic=False):
+    """Build a web_search tool_use dict in OpenAI or Anthropic shape."""
+    if anthropic:
+        return {"id": "toolu_1", "name": "web_search", "input": {"query": query}}
+    args = json.dumps({"query": query}) if as_string else {"query": query}
+    return {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "web_search", "arguments": args},
+    }
+
+
+def _events_for(response, mapping):
+    """
+    Build a mock parse_kiro_stream that yields per-response event lists.
+
+    Args:
+        response: unused (signature compatibility)
+        mapping: dict {response_obj: [KiroEvent, ...]}
+
+    Returns:
+        An async generator function suitable for patching parse_kiro_stream.
+    """
+    async def _mock(resp, *args, **kwargs):
+        for ev in mapping.get(resp, []):
+            yield ev
+    return _mock
 
 
 # ==================================================================================================
@@ -600,3 +696,450 @@ class TestOpenAISSEEmulation:
         
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+# ==================================================================================================
+# Tests for web_search query extraction helper
+# ==================================================================================================
+
+class TestExtractWebSearchQuery:
+    """Tests for _extract_web_search_query."""
+
+    def test_openai_dict_arguments(self):
+        """OpenAI-style tool with dict arguments extracts query."""
+        tool = _make_ws_tool(query="paris weather")
+        assert _extract_web_search_query(tool) == "paris weather"
+
+    def test_openai_string_arguments(self):
+        """OpenAI-style tool with JSON-string arguments extracts query."""
+        tool = _make_ws_tool(query="london news", as_string=True)
+        assert _extract_web_search_query(tool) == "london news"
+
+    def test_anthropic_input_field(self):
+        """Anthropic-style tool with input field extracts query."""
+        tool = _make_ws_tool(query="tokyo weather", anthropic=True)
+        assert _extract_web_search_query(tool) == "tokyo weather"
+
+    def test_invalid_json_string_returns_none(self):
+        """Malformed JSON string arguments yield None."""
+        tool = {
+            "id": "c1", "type": "function",
+            "function": {"name": "web_search", "arguments": "{not json"},
+        }
+        assert _extract_web_search_query(tool) is None
+
+    def test_missing_query_returns_none(self):
+        """Arguments without query key yield None."""
+        tool = {
+            "id": "c1", "type": "function",
+            "function": {"name": "web_search", "arguments": {"q": "x"}},
+        }
+        assert _extract_web_search_query(tool) is None
+
+    def test_empty_query_returns_none(self):
+        """Empty/whitespace query yields None."""
+        tool = _make_ws_tool(query="   ")
+        assert _extract_web_search_query(tool) is None
+
+    def test_non_dict_arguments_returns_none(self):
+        """Non-dict, non-string arguments yield None."""
+        tool = {
+            "id": "c1", "type": "function",
+            "function": {"name": "web_search", "arguments": 123},
+        }
+        assert _extract_web_search_query(tool) is None
+
+
+# ==================================================================================================
+# Tests for build_web_search_continuation_payload
+# ==================================================================================================
+
+class TestBuildWebSearchContinuationPayload:
+    """Tests for the continuation payload constructor."""
+
+    def test_original_payload_not_mutated(self):
+        """The caller's base_payload must remain untouched."""
+        base = _make_base_payload()
+        original = json.loads(json.dumps(base))
+        build_web_search_continuation_payload(base, "q", "tid", _make_results(), "text")
+        assert base == original
+
+    def test_current_message_moved_to_history(self):
+        """The original currentMessage is appended to history."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "text")
+        history = result["conversationState"]["history"]
+        assert history[-2]["userInputMessage"]["content"] == "What is the weather in Paris?"
+
+    def test_assistant_tooluse_appended(self):
+        """A synthetic assistantResponseMessage with web_search toolUses is appended."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "paris", "tid", _make_results(), "")
+        assistant = result["conversationState"]["history"][-1]["assistantResponseMessage"]
+        assert assistant["toolUses"][0]["name"] == "web_search"
+        assert assistant["toolUses"][0]["input"] == {"query": "paris"}
+        assert assistant["toolUses"][0]["toolUseId"] == "tid"
+
+    def test_empty_assistant_text_uses_placeholder(self):
+        """Empty assistant_text falls back to placeholder (Kiro requires non-empty)."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        assert result["conversationState"]["history"][-1]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+
+    def test_assistant_text_preserved(self):
+        """Non-empty assistant_text is used as the assistant message content."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "Let me search.")
+        assert result["conversationState"]["history"][-1]["assistantResponseMessage"]["content"] == "Let me search."
+
+    def test_new_current_message_has_tool_results(self):
+        """New currentMessage contains toolResults with the search summary."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        current = result["conversationState"]["currentMessage"]["userInputMessage"]
+        tool_results = current["userInputMessageContext"]["toolResults"]
+        assert len(tool_results) == 1
+        assert tool_results[0]["toolUseId"] == "tid"
+        assert tool_results[0]["status"] == "success"
+        assert "web_search" in tool_results[0]["content"][0]["text"]
+
+    def test_tools_preserved_for_re_search(self):
+        """The tools definition is preserved so the model can search again."""
+        base = _make_base_payload(with_tools=True)
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        context = result["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+        assert "tools" in context
+        assert context["tools"][0]["toolSpecification"]["name"] == "web_search"
+
+    def test_no_tools_stays_absent(self):
+        """When base payload has no tools, continuation also has no tools."""
+        base = _make_base_payload(with_tools=False)
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        context = result["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+        assert "tools" not in context
+
+    def test_model_id_preserved(self):
+        """Model ID carries over from the original current message."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        assert result["conversationState"]["currentMessage"]["userInputMessage"]["modelId"] == "claude-sonnet-4.5"
+
+    def test_profile_arn_preserved(self):
+        """profileArn survives the deep copy."""
+        base = _make_base_payload()
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        assert result["profileArn"] == "arn:test"
+
+    def test_existing_history_extended_not_replaced(self):
+        """Pre-existing history entries are preserved, not replaced."""
+        base = _make_base_payload(with_history=True)
+        result = build_web_search_continuation_payload(base, "q", "tid", _make_results(), "")
+        history = result["conversationState"]["history"]
+        # 2 original + 1 moved current + 1 synthetic assistant = 4
+        assert len(history) == 4
+        assert history[0]["userInputMessage"]["content"] == "hi"
+
+    def test_invalid_payload_raises(self):
+        """Missing conversationState raises ValueError."""
+        with pytest.raises(ValueError):
+            build_web_search_continuation_payload({}, "q", "tid", _make_results(), "text")
+
+    def test_missing_current_message_raises(self):
+        """Missing currentMessage.userInputMessage raises ValueError."""
+        base = {"conversationState": {"currentMessage": {}}}
+        with pytest.raises(ValueError):
+            build_web_search_continuation_payload(base, "q", "tid", _make_results(), "text")
+
+
+# ==================================================================================================
+# Tests for web_search_event_source
+# ==================================================================================================
+
+class TestWebSearchEventSource:
+    """Tests for the continuation event source."""
+
+    @pytest.mark.asyncio
+    async def test_no_web_search_passes_through(self):
+        """Without web_search, all events pass through unchanged."""
+        events = [
+            KiroEvent(type="content", content="answer"),
+            KiroEvent(type="usage", usage={"x": 1}),
+        ]
+        resp = Mock()
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp, {resp: events})):
+            collected = []
+            async for ev in web_search_event_source(resp, None, None, 5.0):
+                collected.append(ev)
+        assert [e.type for e in collected] == ["content", "usage"]
+
+    @pytest.mark.asyncio
+    async def test_continuation_emits_web_search_event_then_model_text(self):
+        """web_search triggers a synthetic event, then continuation model text."""
+        resp1 = Mock()
+        resp2 = Mock()
+        resp2.status_code = 200
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+        events2 = [KiroEvent(type="content", content="It's sunny.")]
+
+        async def send(payload):
+            return resp2
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1, resp2: events2})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=("srvtoolu_1", _make_results()))):
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        types = [e.type for e in collected]
+        assert "web_search" in types
+        assert "content" in types
+        ws_event = next(e for e in collected if e.type == "web_search")
+        assert ws_event.web_search["query"] == "paris weather"
+        assert ws_event.web_search["tool_use_id"] == "srvtoolu_1"
+        # The model's follow-up text is the visible answer
+        content_events = [e for e in collected if e.type == "content"]
+        assert any("sunny" in (e.content or "") for e in content_events)
+
+    @pytest.mark.asyncio
+    async def test_continuation_disabled_emits_raw_summary(self):
+        """When continuation is None, web_search emits no synthetic event (passthrough)."""
+        resp1 = Mock()
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            collected = []
+            async for ev in web_search_event_source(resp1, None, None, 5.0):
+                collected.append(ev)
+
+        # With continuation disabled, the tool_use passes through as-is
+        assert len(collected) == 1
+        assert collected[0].type == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_mcp_failure_passes_tool_use_through(self):
+        """When MCP call fails, the original tool_use event is passed through."""
+        resp1 = Mock()
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+
+        async def send(payload):
+            return Mock(status_code=200)
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=(None, None))):
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        assert len(collected) == 1
+        assert collected[0].type == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_iteration_limit_emits_raw_summary(self):
+        """Reaching max_iterations emits raw summary as content and stops."""
+        resp1 = Mock()
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+
+        async def send(payload):
+            return Mock(status_code=200)
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=1)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=("srvtoolu_1", _make_results()))):
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        types = [e.type for e in collected]
+        assert "web_search" in types
+        # Raw summary emitted as content (fallback at limit)
+        content_events = [e for e in collected if e.type == "content"]
+        assert any("web_search" in (e.content or "") for e in content_events)
+
+    @pytest.mark.asyncio
+    async def test_non_200_continuation_falls_back_to_raw_summary(self):
+        """A non-200 continuation response emits raw summary as fallback."""
+        resp1 = Mock()
+        resp2 = Mock()
+        resp2.status_code = 500
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+
+        async def send(payload):
+            return resp2
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=("srvtoolu_1", _make_results()))):
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        content_events = [e for e in collected if e.type == "content"]
+        assert any("web_search" in (e.content or "") for e in content_events)
+
+    @pytest.mark.asyncio
+    async def test_send_request_exception_falls_back_to_raw_summary(self):
+        """send_request raising falls back to raw summary instead of crashing."""
+        resp1 = Mock()
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+
+        async def send(payload):
+            raise RuntimeError("boom")
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=("srvtoolu_1", _make_results()))):
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        content_events = [e for e in collected if e.type == "content"]
+        assert any("web_search" in (e.content or "") for e in content_events)
+
+    @pytest.mark.asyncio
+    async def test_web_search_without_query_skipped(self):
+        """A web_search tool_use without a query is skipped (no MCP call)."""
+        resp1 = Mock()
+        tool = {
+            "id": "c1", "type": "function",
+            "function": {"name": "web_search", "arguments": {}},
+        }
+        events1 = [KiroEvent(type="tool_use", tool_use=tool)]
+
+        async def send(payload):
+            return Mock(status_code=200)
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock()) as mock_mcp:
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        mock_mcp.assert_not_called()
+        # Nothing emitted, stream ends
+        assert collected == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_web_search_rounds(self):
+        """Multiple consecutive searches trigger multiple continuation rounds."""
+        resp1 = Mock()
+        resp2 = Mock()
+        resp3 = Mock()
+        resp2.status_code = 200
+        resp3.status_code = 200
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q1"))]
+        events2 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q2"))]
+        events3 = [KiroEvent(type="content", content="final answer")]
+
+        responses = iter([resp2, resp3])
+
+        async def send(payload):
+            return next(responses)
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        mapping = {resp1: events1, resp2: events2, resp3: events3}
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, mapping)):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(side_effect=[
+                ("srvtoolu_1", _make_results()),
+                ("srvtoolu_2", _make_results()),
+            ])):
+                collected = []
+                async for ev in web_search_event_source(resp1, cont, "auth", 5.0):
+                    collected.append(ev)
+
+        ws_events = [e for e in collected if e.type == "web_search"]
+        assert len(ws_events) == 2
+        content_events = [e for e in collected if e.type == "content"]
+        assert any("final answer" in (e.content or "") for e in content_events)
+
+    @pytest.mark.asyncio
+    async def test_continuation_response_closed_on_transition(self):
+        """The previous continuation response is closed when transitioning."""
+        resp1 = Mock()
+        resp2 = Mock()
+        resp2.status_code = 200
+        resp2.aclose = AsyncMock()
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+        events2 = [KiroEvent(type="content", content="done")]
+
+        async def send(payload):
+            return resp2
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1, resp2: events2})):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=("srvtoolu_1", _make_results()))):
+                async for _ in web_search_event_source(resp1, cont, "auth", 5.0):
+                    pass
+
+        resp2.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_initial_response_not_closed(self):
+        """The caller-owned initial response is never closed by event_source."""
+        resp1 = Mock()
+        events1 = [KiroEvent(type="content", content="hi")]
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, {resp1: events1})):
+            async for _ in web_search_event_source(resp1, None, None, 5.0):
+                pass
+
+        resp1.aclose.assert_not_called()
+
+
+# ==================================================================================================
+# Tests for collect_stream_to_result with web_search continuation
+# ==================================================================================================
+
+class TestCollectStreamToResultContinuation:
+    """Tests for collect_stream_to_result web_search integration."""
+
+    @pytest.mark.asyncio
+    async def test_collects_web_searches_when_continuation(self):
+        """collect_stream_to_result records executed web searches."""
+        from kiro.streaming_core import collect_stream_to_result
+
+        resp1 = Mock()
+        resp2 = Mock()
+        resp2.status_code = 200
+        events1 = [KiroEvent(type="tool_use", tool_use=_make_ws_tool())]
+        events2 = [KiroEvent(type="content", content="answer")]
+
+        async def send(payload):
+            return resp2
+
+        cont = WebSearchContinuation(base_payload=_make_base_payload(), send_request=send, max_iterations=5)
+
+        mapping = {resp1: events1, resp2: events2}
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(resp1, mapping)):
+            with patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(return_value=("srvtoolu_1", _make_results()))):
+                result = await collect_stream_to_result(
+                    resp1, auth_manager="auth", web_search_continuation=cont
+                )
+
+        assert len(result.web_searches) == 1
+        assert result.web_searches[0]["query"] == "paris weather"
+        assert result.content == "answer"
+
+    @pytest.mark.asyncio
+    async def test_no_continuation_uses_raw_parse(self):
+        """Without continuation, web_searches stays empty (raw parse path)."""
+        from kiro.streaming_core import collect_stream_to_result
+
+        resp = Mock()
+        events = [KiroEvent(type="content", content="plain")]
+
+        with patch("kiro.streaming_core.parse_kiro_stream", _events_for(resp, {resp: events})):
+            result = await collect_stream_to_result(resp)
+
+        assert result.web_searches == []
+        assert result.content == "plain"

@@ -85,6 +85,7 @@ class KiroEvent:
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
+    web_search: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -104,6 +105,7 @@ class StreamResult:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    web_searches: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class FirstTokenTimeoutError(Exception):
@@ -289,7 +291,9 @@ async def _process_chunk(
 async def collect_stream_to_result(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
-    enable_thinking_parser: bool = True
+    enable_thinking_parser: bool = True,
+    auth_manager: Optional[Any] = None,
+    web_search_continuation: Optional[Any] = None,
 ) -> StreamResult:
     """
     Collects full response from Kiro stream.
@@ -297,24 +301,47 @@ async def collect_stream_to_result(
     This function consumes the entire stream and returns a StreamResult
     with all accumulated data.
     
+    When ``web_search_continuation`` is provided, the stream is consumed through
+    ``kiro.mcp_tools.web_search_event_source`` so that web_search tool calls are
+    executed and fed back to the model (tool round-trip). The model's follow-up
+    text is accumulated into ``result.content``, and each executed search is
+    recorded in ``result.web_searches`` for transparency. When omitted, the raw
+    parse_kiro_stream path is used (no continuation).
+    
     Args:
         response: HTTP response with stream
         first_token_timeout: First token wait timeout
         enable_thinking_parser: Whether to enable thinking block parsing
+        auth_manager: Auth manager for the web_search MCP call (required when
+            web_search_continuation is provided)
+        web_search_continuation: Optional continuation context enabling the
+            web_search tool round-trip
     
     Returns:
-        StreamResult with full content, thinking, tool calls, and usage
+        StreamResult with full content, thinking, tool calls, usage, and any
+        executed web searches
     """
     result = StreamResult()
     full_content_for_bracket_tools = ""
     
-    async for event in parse_kiro_stream(response, first_token_timeout, enable_thinking_parser):
+    # Select the event source: continuation-aware when configured, else raw parse.
+    if web_search_continuation is not None:
+        from kiro.mcp_tools import web_search_event_source
+        event_source = web_search_event_source(
+            response, web_search_continuation, auth_manager, first_token_timeout
+        )
+    else:
+        event_source = parse_kiro_stream(response, first_token_timeout, enable_thinking_parser)
+    
+    async for event in event_source:
         if event.type == "content" and event.content:
             result.content += event.content
             full_content_for_bracket_tools += event.content
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
             full_content_for_bracket_tools += event.thinking_content
+        elif event.type == "web_search" and event.web_search:
+            result.web_searches.append(event.web_search)
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:

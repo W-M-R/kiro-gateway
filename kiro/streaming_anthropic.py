@@ -54,6 +54,7 @@ from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASO
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
     from kiro.cache import ModelInfoCache
+    from kiro.mcp_tools import WebSearchContinuation
 
 # Import debug_logger for logging
 try:
@@ -135,7 +136,8 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -153,6 +155,11 @@ async def stream_kiro_to_anthropic(
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
+        web_search_continuation: Optional continuation context enabling the
+            web_search tool round-trip. When provided, web_search calls are
+            executed and fed back to the model so it can produce a final answer
+            (see kiro.mcp_tools.web_search_event_source). When None, web_search
+            results are emitted as raw text (legacy behaviour).
     
     Yields:
         Strings in Anthropic SSE format
@@ -220,7 +227,20 @@ async def stream_kiro_to_anthropic(
             }
         })
         
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        # Select the event source. With a web_search continuation context,
+        # route through web_search_event_source so web_search calls are executed
+        # and fed back to the model (tool round-trip). Without it (web_search
+        # disabled), use parse_kiro_stream directly to keep behaviour identical
+        # to the non-web_search path.
+        if web_search_continuation is not None:
+            from kiro.mcp_tools import web_search_event_source
+            event_source = web_search_event_source(
+                response, web_search_continuation, auth_manager, first_token_timeout
+            )
+        else:
+            event_source = parse_kiro_stream(response, first_token_timeout)
+
+        async for event in event_source:
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
@@ -323,6 +343,89 @@ async def stream_kiro_to_anthropic(
                         })
                 # For "strip" mode, we just skip the thinking content
             
+            elif event.type == "web_search" and event.web_search:
+                # ==============================================================================
+                # WebSearch transparency blocks (continuation flow)
+                # ==============================================================================
+                # The search was already executed by web_search_event_source and the
+                # results will be fed back to the model, whose follow-up text arrives
+                # as normal "content" events. Here we only emit the Anthropic-native
+                # transparency blocks (server_tool_use + web_search_tool_result) so
+                # clients can display what was searched. No raw summary text is emitted
+                # unless a fallback "content" event follows (limit/failure cases).
+
+                # Close thinking block if open
+                if thinking_block_started and thinking_block_index is not None:
+                    yield format_sse_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": thinking_block_index
+                    })
+                    thinking_block_started = False
+                    current_block_index += 1
+
+                # Close text block if open (assistant text before the search)
+                if text_block_started and text_block_index is not None:
+                    yield format_sse_event("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": text_block_index
+                    })
+                    text_block_started = False
+                    current_block_index += 1
+
+                ws_query = event.web_search.get("query", "")
+                ws_tool_use_id = event.web_search.get("tool_use_id", "")
+                ws_results = event.web_search.get("results", {}) or {}
+
+                # Event: content_block_start (server_tool_use)
+                yield format_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": current_block_index,
+                    "content_block": {
+                        "id": ws_tool_use_id,
+                        "type": "server_tool_use",
+                        "name": "web_search",
+                        "input": {}
+                    }
+                })
+                yield format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": current_block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps({"query": ws_query})
+                    }
+                })
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": current_block_index
+                })
+                current_block_index += 1
+
+                # Event: content_block_start (web_search_tool_result)
+                search_content = []
+                for r in ws_results.get("results", []):
+                    search_content.append({
+                        "type": "web_search_result",
+                        "title": r.get("title", ""),
+                        "url": r.get("url", ""),
+                        "encrypted_content": r.get("snippet", ""),
+                        "page_age": None
+                    })
+                yield format_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": current_block_index,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": ws_tool_use_id,
+                        "content": search_content
+                    }
+                })
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": current_block_index
+                })
+                current_block_index += 1
+
             elif event.type == "tool_use" and event.tool_use:
                 # Close thinking block if open
                 if thinking_block_started and thinking_block_index is not None:
@@ -346,126 +449,6 @@ async def stream_kiro_to_anthropic(
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = tool.get("function", {}).get("name", "") or tool.get("name", "")
                 tool_input = tool.get("function", {}).get("arguments", {}) or tool.get("input", {})
-                
-                # ==============================================================================
-                # WebSearch Support - Path B: MCP Tool Emulation (Streaming Interception)
-                # ==============================================================================
-                
-                # INTERCEPT web_search tool calls (Path B - MCP emulation)
-                if tool_name == "web_search":
-                    from kiro.mcp_tools import call_kiro_mcp_api, generate_search_summary
-                    
-                    logger.info("Intercepted web_search tool call (Path B - MCP emulation)")
-                    
-                    # Parse tool_input if string
-                    if isinstance(tool_input, str):
-                        try:
-                            tool_input = json.loads(tool_input)
-                        except json.JSONDecodeError:
-                            tool_input = {}
-                    
-                    # Extract query
-                    query = tool_input.get("query", "")
-                    if not query:
-                        logger.warning("web_search called without query, skipping MCP call")
-                        continue
-                    
-                    logger.debug(f"WebSearch query (Path B): {query}")
-                    
-                    # Call MCP API
-                    mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
-                    
-                    if results is None:
-                        logger.error("MCP API call failed for web_search")
-                        # Continue with normal tool_use processing (will show error to user)
-                    else:
-                        # Emit server_tool_use + web_search_tool_result + text summary
-                        # (full SSE sequence as in mcp_tools.py)
-                        
-                        # Event: content_block_start (server_tool_use)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {
-                                "id": mcp_tool_use_id,
-                                "type": "server_tool_use",
-                                "name": "web_search",
-                                "input": {}
-                            }
-                        })
-                        
-                        # Event: content_block_delta (input_json_delta)
-                        yield format_sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": current_block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": json.dumps({"query": query})
-                            }
-                        })
-                        
-                        # Event: content_block_stop (server_tool_use)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
-                        # Event: content_block_start (web_search_tool_result)
-                        search_content = []
-                        for r in results.get("results", []):
-                            search_content.append({
-                                "type": "web_search_result",
-                                "title": r.get("title", ""),
-                                "url": r.get("url", ""),
-                                "encrypted_content": r.get("snippet", ""),
-                                "page_age": None
-                            })
-                        
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {
-                                "type": "web_search_tool_result",
-                                "tool_use_id": mcp_tool_use_id,
-                                "content": search_content
-                            }
-                        })
-                        
-                        # Event: content_block_stop (web_search_tool_result)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
-                        # Event: content_block_start (text)
-                        yield format_sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {"type": "text", "text": ""}
-                        })
-                        
-                        # Events: content_block_delta (text_delta) - stream summary
-                        summary = generate_search_summary(query, results)
-                        chunk_size = 100
-                        for i in range(0, len(summary), chunk_size):
-                            chunk = summary[i:i + chunk_size]
-                            yield format_sse_event("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "text_delta", "text": chunk}
-                            })
-                        
-                        # Event: content_block_stop (text)
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": current_block_index
-                        })
-                        current_block_index += 1
-                        
-                        # Skip normal tool_use processing
-                        continue
                 
                 # Check if this tool was truncated
                 if tool.get('_truncation_detected'):
@@ -725,7 +708,8 @@ async def collect_anthropic_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -740,6 +724,10 @@ async def collect_anthropic_response(
         request_messages: Original request messages (for token counting)
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
+        web_search_continuation: Optional continuation context enabling the
+            web_search tool round-trip. When provided, web_search calls are
+            executed and fed back to the model, and each search is rendered as
+            server_tool_use + web_search_tool_result transparency blocks.
     
     Returns:
         Dictionary with full response in Anthropic Messages format
@@ -757,8 +745,12 @@ async def collect_anthropic_response(
         )
         input_tokens = request_token_stats["total_tokens"]
     
-    # Collect stream result
-    result = await collect_stream_to_result(response)
+    # Collect stream result (continuation-aware: executes web_search round-trips)
+    result = await collect_stream_to_result(
+        response,
+        auth_manager=auth_manager,
+        web_search_continuation=web_search_continuation,
+    )
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
@@ -770,6 +762,33 @@ async def collect_anthropic_response(
             "type": "thinking",
             "thinking": result.thinking_content,
             "signature": generate_thinking_signature()
+        })
+    
+    # Add web_search transparency blocks (server_tool_use + web_search_tool_result)
+    # for each executed search, before the final answer text.
+    for ws in result.web_searches:
+        ws_query = ws.get("query", "")
+        ws_tool_use_id = ws.get("tool_use_id", "")
+        ws_results = ws.get("results", {}) or {}
+        content_blocks.append({
+            "type": "server_tool_use",
+            "id": ws_tool_use_id,
+            "name": "web_search",
+            "input": {"query": ws_query}
+        })
+        search_content = []
+        for r in ws_results.get("results", []):
+            search_content.append({
+                "type": "web_search_result",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "encrypted_content": r.get("snippet", ""),
+                "page_age": None
+            })
+        content_blocks.append({
+            "type": "web_search_tool_result",
+            "tool_use_id": ws_tool_use_id,
+            "content": search_content
         })
     
     # Add text block if there's content
@@ -873,7 +892,8 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    web_search_continuation: Optional["WebSearchContinuation"] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -934,6 +954,7 @@ async def stream_with_first_token_retry_anthropic(
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
+            web_search_continuation=web_search_continuation,
         ):
             yield chunk
     

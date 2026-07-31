@@ -33,8 +33,9 @@ import time
 import uuid
 import random
 import string
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -49,6 +50,239 @@ try:
     from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
+
+# Module-level import of parse_kiro_stream so it can be patched in tests. There
+# is no circular import: streaming_core does not import mcp_tools.
+from kiro.streaming_core import KiroEvent, parse_kiro_stream  # noqa: E402
+
+
+# ==================================================================================================
+# WebSearch Continuation Context
+# ==================================================================================================
+
+@dataclass
+class WebSearchContinuation:
+    """
+    Context needed to feed web_search results back to the model (tool round-trip).
+
+    When the model calls web_search mid-stream, the gateway executes the search
+    and must issue a follow-up Kiro request so the model can consume the results
+    and produce a final answer. This object carries everything the streaming
+    layer needs to build and dispatch that follow-up request.
+
+    Attributes:
+        base_payload: The Kiro payload originally sent for this request. Used as
+            the template for continuation payloads (see
+            build_web_search_continuation_payload). Never mutated.
+        send_request: Async callback that POSTs a Kiro payload and returns the
+            streaming httpx.Response. Provided by the route layer so the
+            continuation reuses the same HTTP client, auth, and retry logic.
+            Must return an httpx.Response; a non-200 response triggers the
+            raw-summary fallback rather than an exception.
+        max_iterations: Maximum number of consecutive web_search rounds allowed
+            for this request (from WEB_SEARCH_MAX_ITERATIONS). Once reached, the
+            raw search summary is emitted to the client instead of continuing.
+    """
+    base_payload: Dict[str, Any]
+    send_request: Callable[[Dict[str, Any]], Awaitable[httpx.Response]]
+    max_iterations: int
+
+
+def _extract_web_search_query(tool: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract the search query from a web_search tool_use event.
+
+    Handles both OpenAI-style (function.arguments) and Anthropic-style (input)
+    tool structures, with arguments as either a JSON string or a dict.
+
+    Args:
+        tool: Tool-use dict from a KiroEvent (event.tool_use).
+
+    Returns:
+        The query string, or None if absent/unparseable.
+    """
+    tool_input = (tool.get("function", {}) or {}).get("arguments", None)
+    if tool_input is None:
+        tool_input = tool.get("input", {})
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(tool_input, dict):
+        return None
+    query = tool_input.get("query", "")
+    return query.strip() if isinstance(query, str) and query.strip() else None
+
+
+async def web_search_event_source(
+    initial_response: "httpx.Response",
+    continuation: Optional[WebSearchContinuation],
+    auth_manager,
+    first_token_timeout: float,
+):
+    """
+    Yield Kiro events across one or more responses, resolving web_search calls.
+
+    This async generator wraps ``parse_kiro_stream`` and transparently turns the
+    "model requests web_search → gateway executes search → model consumes results"
+    round-trip into a continuous event stream. Consumers (OpenAI/Anthropic
+    streaming formatters) iterate it exactly like ``parse_kiro_stream`` and stay
+    largely unchanged.
+
+    Behaviour:
+    - Non-web_search events (content, thinking, usage, context_usage, normal
+      tool_use) pass through unchanged.
+    - When a ``web_search`` tool_use is seen and ``continuation`` is provided:
+        1. The search is executed via the MCP API.
+        2. A synthetic ``web_search`` event is emitted carrying the query,
+           tool_use_id, and results so the formatter can render transparency
+           blocks (Anthropic) or ignore them (OpenAI).
+        3. A follow-up Kiro request is dispatched with the tool result appended
+           to history, and iteration continues over the new response — the
+           model's follow-up text becomes the visible answer.
+    - Fallbacks that emit the raw summary as ``content`` events (legacy
+      behaviour) instead of continuing:
+        * ``continuation`` is None (feature disabled).
+        * The iteration limit (``max_iterations``) is reached.
+        * The MCP call fails or returns no results (in which case the original
+          tool_use passes through so the client still sees the attempt).
+        * The follow-up Kiro request returns a non-200 response.
+
+    Response lifecycle: the initial response is owned/closed by the caller; every
+    continuation response opened here is closed here (on transition or via the
+    finally block), preventing connection leaks.
+
+    Args:
+        initial_response: The already-validated (HTTP 200) first Kiro response.
+        continuation: Continuation context, or None to disable continuation.
+        auth_manager: Auth manager used for the MCP web_search call.
+        first_token_timeout: First-token timeout forwarded to parse_kiro_stream.
+
+    Yields:
+        KiroEvent objects (including synthetic ``web_search`` events).
+    """
+    # Imported at module level (see above) so it can be patched in tests.
+    current_response = initial_response
+    owns_current = False  # initial response is owned by the caller
+    iteration = 0
+
+    try:
+        while True:
+            assistant_text = ""
+            pending: Optional[Tuple[str, str, Dict]] = None  # (query, tool_use_id, results)
+
+            async for event in parse_kiro_stream(current_response, first_token_timeout):
+                if event.type == "content":
+                    assistant_text += event.content or ""
+                    yield event
+                    continue
+
+                if event.type == "tool_use" and event.tool_use:
+                    tool = event.tool_use
+                    tool_name = (tool.get("function", {}) or {}).get("name", "") or tool.get("name", "")
+
+                    if tool_name != "web_search" or continuation is None:
+                        # Normal tool call (or continuation disabled) — pass through.
+                        yield event
+                        continue
+
+                    query = _extract_web_search_query(tool)
+                    if not query:
+                        logger.warning("web_search called without query, skipping MCP call")
+                        continue
+
+                    logger.info("Intercepted web_search tool call (continuation flow)")
+                    mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
+
+                    if results is None:
+                        # MCP failed — surface the original tool call so the
+                        # client still sees the attempt (legacy passthrough).
+                        logger.error("MCP API call failed for web_search, passing tool_use through")
+                        yield event
+                        continue
+
+                    iteration += 1
+
+                    # Emit transparency event (formatters decide how to render).
+                    yield KiroEvent(
+                        type="web_search",
+                        web_search={
+                            "query": query,
+                            "tool_use_id": mcp_tool_use_id,
+                            "results": results,
+                        },
+                    )
+
+                    if iteration >= continuation.max_iterations:
+                        # Iteration limit reached — emit raw summary and stop.
+                        logger.warning(
+                            f"web_search iteration limit ({continuation.max_iterations}) reached, "
+                            f"emitting raw summary instead of continuing"
+                        )
+                        summary = generate_search_summary(query, results)
+                        yield KiroEvent(type="content", content=summary)
+                        return
+
+                    pending = (query, mcp_tool_use_id, results)
+                    break  # exit inner loop to dispatch continuation request
+
+                # thinking / usage / context_usage / anything else
+                yield event
+            else:
+                # Inner loop exhausted without a continuation — we're done.
+                return
+
+            # A web_search continuation was requested.
+            if pending is None:
+                return
+
+            query, tool_use_id, results = pending
+            try:
+                new_payload = build_web_search_continuation_payload(
+                    continuation.base_payload, query, tool_use_id, results, assistant_text
+                )
+                new_response = await continuation.send_request(new_payload)
+            except Exception as e:
+                logger.error(
+                    f"Failed to dispatch web_search continuation request: {e}, "
+                    f"emitting raw summary as fallback",
+                    exc_info=True,
+                )
+                yield KiroEvent(type="content", content=generate_search_summary(query, results))
+                return
+
+            # Non-200 from the continuation request — fall back to raw summary.
+            if new_response.status_code != 200:
+                logger.error(
+                    f"web_search continuation request returned {new_response.status_code}, "
+                    f"emitting raw summary as fallback"
+                )
+                try:
+                    await new_response.aclose()
+                except Exception:
+                    pass
+                yield KiroEvent(type="content", content=generate_search_summary(query, results))
+                return
+
+            # Transition to the new response, closing the previous continuation
+            # response (never the caller-owned initial response).
+            if owns_current and current_response is not None:
+                try:
+                    await current_response.aclose()
+                except Exception:
+                    pass
+            current_response = new_response
+            owns_current = True
+            # loop continues, iterating over the continuation response
+    finally:
+        # Close the final continuation response if we own it. The initial
+        # response is closed by the caller's own finally block.
+        if owns_current and current_response is not None:
+            try:
+                await current_response.aclose()
+            except Exception:
+                pass
 
 
 # ==================================================================================================
@@ -210,6 +444,117 @@ async def call_kiro_mcp_api(
     except Exception as e:
         logger.error(f"MCP API unexpected exception: {e}", exc_info=True)
         return None, None
+
+
+def build_web_search_continuation_payload(
+    base_payload: Dict[str, Any],
+    query: str,
+    tool_use_id: str,
+    results: Dict,
+    assistant_text: str,
+) -> Dict[str, Any]:
+    """
+    Build a follow-up Kiro payload that feeds web_search results back to the model.
+
+    When the model calls web_search, the assistant turn ends after emitting the
+    tool_use request. To let the model actually consume the search results and
+    produce a final answer, the gateway must issue a second Kiro request that
+    contains the completed tool-use round-trip in the conversation history.
+
+    This constructor is API-agnostic: the Kiro payload structure is identical for
+    OpenAI and Anthropic clients, so both streaming paths share this logic.
+
+    Transformation applied to a copy of ``base_payload``:
+    1. The original ``currentMessage`` is appended to ``history`` (it was the
+       user turn that triggered the search).
+    2. A synthetic ``assistantResponseMessage`` carrying the web_search
+       ``toolUses`` entry is appended (the assistant's decision to search).
+    3. A new ``currentMessage`` is created: a user turn whose
+       ``userInputMessageContext.toolResults`` holds the search summary, while
+       preserving the ``tools`` definition so the model can search again.
+
+    Args:
+        base_payload: The original Kiro payload sent for this request. Not
+            mutated — a deep copy is returned.
+        query: The search query the model requested.
+        tool_use_id: The tool-use identifier linking the toolUse to its result.
+        results: Parsed MCP web_search response (dict with a "results" key).
+        assistant_text: Any assistant text emitted before the tool call. Used as
+            the assistant message content; falls back to a placeholder if empty
+            (Kiro API requires non-empty content).
+
+    Returns:
+        A new Kiro payload dict ready to POST to /generateAssistantResponse.
+
+    Raises:
+        ValueError: If ``base_payload`` is missing the expected
+            ``conversationState.currentMessage`` structure.
+    """
+    import copy
+
+    conversation_state = base_payload.get("conversationState")
+    if not isinstance(conversation_state, dict):
+        raise ValueError("base_payload missing 'conversationState'")
+
+    current_message = conversation_state.get("currentMessage")
+    if not isinstance(current_message, dict) or "userInputMessage" not in current_message:
+        raise ValueError("base_payload missing 'currentMessage.userInputMessage'")
+
+    # Work on a deep copy so the caller's payload (used for retries) is untouched.
+    new_payload = copy.deepcopy(base_payload)
+    new_state = new_payload["conversationState"]
+
+    # Preserve the model ID and tools from the original user message so the
+    # follow-up turn stays consistent and the model can search again.
+    original_user_input = current_message["userInputMessage"]
+    model_id = original_user_input.get("modelId", "")
+    original_context = original_user_input.get("userInputMessageContext", {})
+    tools = original_context.get("tools") if isinstance(original_context, dict) else None
+
+    # 1. Move the original current message into history.
+    history = new_state.get("history")
+    if not isinstance(history, list):
+        history = []
+    history.append(copy.deepcopy(current_message))
+
+    # 2. Append the assistant's tool-use decision.
+    assistant_content = assistant_text.strip() if assistant_text else ""
+    if not assistant_content:
+        assistant_content = "(empty placeholder)"
+    history.append({
+        "assistantResponseMessage": {
+            "content": assistant_content,
+            "toolUses": [{
+                "name": "web_search",
+                "input": {"query": query},
+                "toolUseId": tool_use_id,
+            }],
+        }
+    })
+
+    # 3. Build the new current message carrying the tool result.
+    summary = generate_search_summary(query, results)
+    new_user_input: Dict[str, Any] = {
+        "content": "(empty placeholder)",
+        "modelId": model_id,
+        "origin": "AI_EDITOR",
+    }
+    new_context: Dict[str, Any] = {
+        "toolResults": [{
+            "content": [{"text": summary}],
+            "status": "success",
+            "toolUseId": tool_use_id,
+        }]
+    }
+    # Preserve tools so the model may call web_search again on the next round.
+    if tools:
+        new_context["tools"] = tools
+    new_user_input["userInputMessageContext"] = new_context
+
+    new_state["history"] = history
+    new_state["currentMessage"] = {"userInputMessage": new_user_input}
+
+    return new_payload
 
 
 def generate_search_summary(query: str, results: Dict) -> str:
