@@ -32,6 +32,7 @@ Routes:
 
 import time
 from datetime import datetime, timezone
+from html import escape
 from typing import Any, Dict, List
 
 from fastapi import FastAPI
@@ -44,6 +45,7 @@ from kiro.config import (
     QUOTA_POLL_INTERVAL,
     STATUS_SERVER_PORT,
 )
+from kiro.quota import QUOTA_UNKNOWN_SENTINEL
 
 
 def create_status_app(account_manager: Any) -> FastAPI:
@@ -93,8 +95,13 @@ def create_status_app(account_manager: Any) -> FastAPI:
         all_accounts = list(am._accounts.values())
         initialized = [a for a in all_accounts if a.auth_manager is not None]
         quota_list = am.get_all_quota_info()
-        exhausted = [q.owner for q in quota_list if q.is_exhausted]
-        available = [q.owner for q in quota_list if not q.is_exhausted]
+        # Only a SUCCESSFUL query proves exhaustion. A failed query reports
+        # is_exhausted=True as a placeholder, but such accounts stay selectable
+        # (see AccountManager._is_account_available), so report them separately
+        # instead of labeling them exhausted.
+        unknown = [q.owner for q in quota_list if q.is_quota_unknown]
+        exhausted = [q.owner for q in quota_list if q.is_exhausted and not q.is_quota_unknown]
+        available = [q.owner for q in quota_list if q.is_quota_unknown or not q.is_exhausted]
         
         return JSONResponse({
             "version": APP_VERSION,
@@ -105,6 +112,7 @@ def create_status_app(account_manager: Any) -> FastAPI:
             "polled_accounts": len(quota_list),
             "available_accounts": available,
             "exhausted_accounts": exhausted,
+            "quota_unknown_accounts": unknown,
             "priority_order": ACCOUNT_PRIORITY,
             "quota_poll_interval": QUOTA_POLL_INTERVAL,
             "server_time": datetime.now(tz=timezone.utc).isoformat(),
@@ -157,11 +165,15 @@ def _render_dashboard(app: FastAPI) -> str:
     all_accounts = list(am._accounts.values())
     quota_list = am.get_all_quota_info()
     
-    # Sort: priority accounts first, then by total_remaining descending
+    # Sort: priority accounts first, then by total_remaining descending.
+    # Accounts whose quota query failed have meaningless figures (0), so rank
+    # them with the same sentinel used by account selection to keep the
+    # dashboard order consistent with the real selection order.
     def sort_key(q):
         is_priority = q.owner in ACCOUNT_PRIORITY
         priority_idx = ACCOUNT_PRIORITY.index(q.owner) if is_priority else len(ACCOUNT_PRIORITY)
-        return (0 if is_priority else 1, priority_idx, -q.total_remaining)
+        remaining = QUOTA_UNKNOWN_SENTINEL if q.is_quota_unknown else q.total_remaining
+        return (0 if is_priority else 1, priority_idx, -remaining)
     
     quota_list_sorted = sorted(quota_list, key=sort_key)
     
@@ -172,7 +184,12 @@ def _render_dashboard(app: FastAPI) -> str:
     for q in quota_list_sorted:
         is_priority = q.owner in ACCOUNT_PRIORITY
         priority_badge = '<span class="badge priority">PRIORITY</span>' if is_priority else ''
-        exhausted_class = ' class="exhausted"' if q.is_exhausted else ''
+        # Only a successful query proves exhaustion. A failed query leaves
+        # is_exhausted=True as a placeholder while the account stays selectable,
+        # so it must not be rendered as exhausted.
+        is_unknown = q.is_quota_unknown
+        truly_exhausted = q.is_exhausted and not is_unknown
+        exhausted_class = ' class="exhausted"' if truly_exhausted else ''
         
         free_color = "green" if q.free_remaining > 0 else "red"
         overage_color = "green" if q.overage_remaining > 1000 else ("orange" if q.overage_remaining > 100 else "red")
@@ -180,18 +197,36 @@ def _render_dashboard(app: FastAPI) -> str:
         free_bar = _quota_bar(q.current_usage, q.usage_limit, "Free", free_color)
         overage_bar = _quota_bar(q.current_overages, q.overage_cap, "Overage", overage_color)
         
-        remaining_display = str(q.total_remaining)
-        if q.is_exhausted:
+        if is_unknown:
+            remaining_display = '<span class="unknown-text">UNKNOWN</span>'
+        elif truly_exhausted:
             remaining_display = '<span class="exhausted-text">EXHAUSTED</span>'
+        else:
+            remaining_display = str(q.total_remaining)
         
+        # Escape every externally-influenced string before embedding it in HTML.
+        # owner comes from a directory name or credentials.json, while
+        # subscription and last_error come straight from the upstream API
+        # response body (see quota.py: response.text[:200]). None of them can be
+        # trusted as markup.
+        owner_html = escape(q.owner)
+        subscription_html = escape(q.subscription)
+
+        # Render the error as its own table row spanning all columns. Appending
+        # it after </tr> produced invalid HTML that browsers relocate outside
+        # the table.
         error_display = ""
         if q.last_error:
-            error_display = f'<br><span class="error-text">{q.last_error}</span>'
-        
+            error_display = (
+                f'\n        <tr{exhausted_class}>'
+                f'<td colspan="6" class="error-text">{escape(q.last_error)}</td>'
+                f'</tr>'
+            )
+
         rows.append(f"""
         <tr{exhausted_class}>
-            <td class="owner">{q.owner} {priority_badge}</td>
-            <td>{q.subscription}</td>
+            <td class="owner">{owner_html} {priority_badge}</td>
+            <td>{subscription_html}</td>
             <td>{free_bar}</td>
             <td>{overage_bar}</td>
             <td class="remaining">{remaining_display}</td>
@@ -200,14 +235,21 @@ def _render_dashboard(app: FastAPI) -> str:
     
     rows_html = "\n".join(rows) if rows else '<tr><td colspan="6" class="muted">No quota data yet. Waiting for first poll...</td></tr>'
     
-    # Summary stats
+    # Summary stats. Accounts whose quota query failed are counted as available
+    # (they remain selectable), not exhausted — matching account selection.
     total = len(all_accounts)
     initialized = len([a for a in all_accounts if a.auth_manager is not None])
     polled = len(quota_list)
-    exhausted_count = len([q for q in quota_list if q.is_exhausted])
+    unknown_count = len([q for q in quota_list if q.is_quota_unknown])
+    exhausted_count = len([q for q in quota_list if q.is_exhausted and not q.is_quota_unknown])
     available_count = polled - exhausted_count
     
-    priority_display = ", ".join(ACCOUNT_PRIORITY) if ACCOUNT_PRIORITY else "<span class='muted'>none (balanced mode)</span>"
+    # Escape the configured owner labels; the fallback branch is intentional markup.
+    priority_display = (
+        escape(", ".join(ACCOUNT_PRIORITY))
+        if ACCOUNT_PRIORITY
+        else "<span class='muted'>none (balanced mode)</span>"
+    )
     
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -254,6 +296,7 @@ def _render_dashboard(app: FastAPI) -> str:
         .owner {{ font-weight: 600; color: #fff; }}
         .remaining {{ font-weight: 600; text-align: center; }}
         .exhausted-text {{ color: #f87171; font-weight: 700; }}
+        .unknown-text {{ color: #fbbf24; font-weight: 700; }}
         .error-text {{ color: #f87171; font-size: 12px; }}
         .badge {{
             display: inline-block; padding: 2px 8px; border-radius: 4px;
@@ -299,6 +342,10 @@ def _render_dashboard(app: FastAPI) -> str:
             <div class="stat-card">
                 <div class="stat-label">Available</div>
                 <div class="stat-value green">{available_count}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Quota Unknown</div>
+                <div class="stat-value {'orange' if unknown_count > 0 else 'green'}">{unknown_count}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Exhausted</div>
