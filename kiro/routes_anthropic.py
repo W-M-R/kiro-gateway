@@ -437,6 +437,22 @@ async def messages(
                     # SUCCESS - report and return
                     await account_manager.report_success(account.id, request_data.model)
                     
+                    # Build web_search continuation context (enables tool round-trip).
+                    # Without this the model emits a web_search tool call, the gateway
+                    # returns the raw results, and the turn ends without the model ever
+                    # synthesizing an answer.
+                    web_search_continuation = None
+                    if WEB_SEARCH_ENABLED:
+                        async def send_continuation_request(payload):
+                            return await http_client.request_with_retry(
+                                "POST", url, payload, stream=True
+                            )
+                        web_search_continuation = WebSearchContinuation(
+                            base_payload=kiro_payload,
+                            send_request=send_continuation_request,
+                            max_iterations=WEB_SEARCH_MAX_ITERATIONS,
+                        )
+                    
                     if request_data.stream:
                         # Streaming mode
                         async def stream_wrapper():
@@ -457,6 +473,7 @@ async def messages(
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
+                                    web_search_continuation=web_search_continuation,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -505,6 +522,7 @@ async def messages(
                             request_messages=messages_for_tokenizer,
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
+                            web_search_continuation=web_search_continuation,
                         )
                         
                         await http_client.close()

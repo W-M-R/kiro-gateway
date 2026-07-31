@@ -1096,6 +1096,217 @@ class TestWebSearchEventSource:
         resp1.aclose.assert_not_called()
 
 
+class TestContinuationPayloadAccumulation:
+    """
+    Regression tests: multi-round web_search must accumulate its payload.
+
+    Each continuation round must build on the PREVIOUS round's payload, not on
+    the original ``continuation.base_payload``. Rebuilding from the original
+    drops every earlier round's toolResults, so the model asks for a search,
+    receives a follow-up turn that no longer contains the result it just
+    requested, and searches again — burning through ``max_iterations`` and
+    ending on the raw-summary fallback instead of a synthesized answer.
+
+    Observed symptom before the fix: 5x "Intercepted web_search tool call"
+    followed by "iteration limit (5) reached, emitting raw summary".
+    """
+
+    @staticmethod
+    def _results_marked(marker: str):
+        """Build results carrying a unique, greppable snippet marker."""
+        return {
+            "results": [{
+                "title": f"Title {marker}",
+                "url": f"https://example.com/{marker}",
+                "snippet": f"DATA-{marker}",
+                "publishedDate": 1700000000000,
+            }],
+            "totalResults": 1,
+            "query": marker,
+        }
+
+    @pytest.mark.asyncio
+    async def test_three_rounds_accumulate_history_and_results(self):
+        """
+        Across 3 search rounds, every continuation payload must retain all
+        previous rounds' tool results and grow its history by 2 entries per
+        round (assistant tool_use + user toolResult).
+        """
+        # 4 responses: 3 that request a search, 1 that answers
+        responses = [Mock(status_code=200) for _ in range(4)]
+        for r in responses:
+            r.aclose = AsyncMock()
+
+        event_map = {
+            responses[0]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q1"))],
+            responses[1]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q2"))],
+            responses[2]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q3"))],
+            responses[3]: [KiroEvent(type="content", content="FINAL ANSWER")],
+        }
+
+        sent_payloads = []
+
+        async def send(payload):
+            sent_payloads.append(payload)
+            return responses[len(sent_payloads)]
+
+        async def fake_mcp(query, auth):
+            return f"srvtoolu_{query}", self._results_marked(query)
+
+        cont = WebSearchContinuation(
+            base_payload=_make_base_payload(),
+            send_request=send,
+            max_iterations=5,
+        )
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(None, event_map)), \
+             patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(side_effect=fake_mcp)):
+            collected = []
+            async for ev in web_search_event_source(responses[0], cont, "auth", 5.0):
+                collected.append(ev)
+
+        assert len(sent_payloads) == 3, "expected one continuation request per search"
+
+        # History grows by 2 per completed round
+        histories = [
+            len(p["conversationState"].get("history", [])) for p in sent_payloads
+        ]
+        assert histories == [2, 4, 6], f"history did not accumulate: {histories}"
+
+        # Every earlier round's results must still be present
+        round2 = json.dumps(sent_payloads[1])
+        assert "DATA-q1" in round2
+
+        round3 = json.dumps(sent_payloads[2])
+        for marker in ("DATA-q1", "DATA-q2", "DATA-q3"):
+            assert marker in round3, f"{marker} lost from final continuation payload"
+
+        # The model's answer must be the visible output, not the raw fallback
+        contents = [e.content or "" for e in collected if e.type == "content"]
+        assert any("FINAL ANSWER" in c for c in contents)
+        assert not any("<web_search>" in c for c in contents), \
+            "should not degrade to the raw-summary fallback"
+
+    @pytest.mark.asyncio
+    async def test_base_payload_never_mutated_across_rounds(self):
+        """
+        The caller's base_payload is reused for retries, so accumulation must
+        never mutate it.
+        """
+        base = _make_base_payload()
+        base_snapshot = json.dumps(base, sort_keys=True)
+
+        responses = [Mock(status_code=200) for _ in range(3)]
+        for r in responses:
+            r.aclose = AsyncMock()
+
+        event_map = {
+            responses[0]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q1"))],
+            responses[1]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q2"))],
+            responses[2]: [KiroEvent(type="content", content="done")],
+        }
+
+        sent = []
+
+        async def send(payload):
+            sent.append(payload)
+            return responses[len(sent)]
+
+        async def fake_mcp(query, auth):
+            return f"srvtoolu_{query}", self._results_marked(query)
+
+        cont = WebSearchContinuation(base_payload=base, send_request=send, max_iterations=5)
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(None, event_map)), \
+             patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(side_effect=fake_mcp)):
+            async for _ in web_search_event_source(responses[0], cont, "auth", 5.0):
+                pass
+
+        assert json.dumps(base, sort_keys=True) == base_snapshot, \
+            "base_payload was mutated during continuation"
+
+    @pytest.mark.asyncio
+    async def test_tools_preserved_in_every_round(self):
+        """
+        The tools definition must survive every round, otherwise the model
+        cannot issue a follow-up search.
+        """
+        responses = [Mock(status_code=200) for _ in range(3)]
+        for r in responses:
+            r.aclose = AsyncMock()
+
+        event_map = {
+            responses[0]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q1"))],
+            responses[1]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q2"))],
+            responses[2]: [KiroEvent(type="content", content="done")],
+        }
+
+        sent = []
+
+        async def send(payload):
+            sent.append(payload)
+            return responses[len(sent)]
+
+        async def fake_mcp(query, auth):
+            return f"srvtoolu_{query}", self._results_marked(query)
+
+        cont = WebSearchContinuation(
+            base_payload=_make_base_payload(with_tools=True),
+            send_request=send,
+            max_iterations=5,
+        )
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(None, event_map)), \
+             patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(side_effect=fake_mcp)):
+            async for _ in web_search_event_source(responses[0], cont, "auth", 5.0):
+                pass
+
+        for i, payload in enumerate(sent, 1):
+            ctx = (payload["conversationState"]["currentMessage"]
+                   ["userInputMessage"].get("userInputMessageContext", {}))
+            assert ctx.get("tools"), f"tools missing from continuation round {i}"
+
+    @pytest.mark.asyncio
+    async def test_preexisting_history_is_preserved(self):
+        """
+        A conversation that already has history must keep it while accumulating
+        new rounds on top.
+        """
+        responses = [Mock(status_code=200) for _ in range(3)]
+        for r in responses:
+            r.aclose = AsyncMock()
+
+        event_map = {
+            responses[0]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q1"))],
+            responses[1]: [KiroEvent(type="tool_use", tool_use=_make_ws_tool(query="q2"))],
+            responses[2]: [KiroEvent(type="content", content="done")],
+        }
+
+        sent = []
+
+        async def send(payload):
+            sent.append(payload)
+            return responses[len(sent)]
+
+        async def fake_mcp(query, auth):
+            return f"srvtoolu_{query}", self._results_marked(query)
+
+        # base already carries 2 history entries
+        cont = WebSearchContinuation(
+            base_payload=_make_base_payload(with_history=True),
+            send_request=send,
+            max_iterations=5,
+        )
+
+        with patch("kiro.mcp_tools.parse_kiro_stream", _events_for(None, event_map)), \
+             patch("kiro.mcp_tools.call_kiro_mcp_api", new=AsyncMock(side_effect=fake_mcp)):
+            async for _ in web_search_event_source(responses[0], cont, "auth", 5.0):
+                pass
+
+        histories = [len(p["conversationState"]["history"]) for p in sent]
+        assert histories == [4, 6], f"pre-existing history not preserved: {histories}"
+
+
 # ==================================================================================================
 # Tests for collect_stream_to_result with web_search continuation
 # ==================================================================================================

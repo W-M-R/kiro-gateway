@@ -167,6 +167,17 @@ async def web_search_event_source(
     owns_current = False  # initial response is owned by the caller
     iteration = 0
 
+    # Payload used to build the NEXT continuation request. It starts as the
+    # original request and accumulates every completed search round, so the model
+    # keeps seeing all prior results.
+    #
+    # Rebuilding from ``continuation.base_payload`` on every round would drop the
+    # earlier rounds' toolResults: the model would request a search, receive a
+    # follow-up turn that no longer contains the result it just asked for, and
+    # search again — burning through max_iterations and ending on the raw-summary
+    # fallback instead of a synthesized answer.
+    current_payload = continuation.base_payload if continuation is not None else None
+
     try:
         while True:
             assistant_text = ""
@@ -239,8 +250,10 @@ async def web_search_event_source(
 
             query, tool_use_id, results = pending
             try:
+                # Build on top of the accumulated payload (not the original one)
+                # so every previous round's toolResults stay in history.
                 new_payload = build_web_search_continuation_payload(
-                    continuation.base_payload, query, tool_use_id, results, assistant_text
+                    current_payload, query, tool_use_id, results, assistant_text
                 )
                 new_response = await continuation.send_request(new_payload)
             except Exception as e:
@@ -274,6 +287,8 @@ async def web_search_event_source(
                     pass
             current_response = new_response
             owns_current = True
+            # Accumulate this round so the next continuation keeps its results.
+            current_payload = new_payload
             # loop continues, iterating over the continuation response
     finally:
         # Close the final continuation response if we own it. The initial
